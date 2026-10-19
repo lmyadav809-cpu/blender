@@ -31,11 +31,24 @@
 #include <android/native_window.h>
 #include <android_native_app_glue.h>
 
+#include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <ctime>
 
 static android_app *g_android_app = nullptr;
+
+/* Blender's native shortcut pad injects key events at the window-manager layer,
+ * not through AInputEvent. Keep those held modifiers available when GHOST is
+ * queried for modifier state; Android's meta_state_ only describes native input.
+ * Bit 0 = Shift, bit 1 = Ctrl, bit 2 = Alt. */
+static std::atomic<uint32_t> g_android_virtual_modifier_mask{0};
+
+extern "C" void GHOST_android_set_virtual_modifier_mask(const uint32_t mask)
+{
+  g_android_virtual_modifier_mask.store(mask & 0x7u, std::memory_order_relaxed);
+}
 
 /* Hold a finger this long without moving to get a right-click. */
 static constexpr uint64_t TOUCH_LONG_PRESS_MS = 500;
@@ -67,8 +80,6 @@ GHOST_SystemAndroid::GHOST_SystemAndroid()
       gesture_start_y_(0.0f),
       gesture_start_dist_(0.0f),
       gesture_kind_(GestureKind::Undecided),
-      touch_pan_active_(false),
-      touch_shift_active_(false),
       touch_pending_(false),
       touch_button_down_(false),
       touch_button_(GHOST_kButtonMaskLeft),
@@ -367,42 +378,15 @@ int32_t GHOST_SystemAndroid::handleMotionEvent(AInputEvent *event)
     return 1;
   }
 
-  /* Three-finger drag: "Move the view" (Shift + middle mouse). Two fingers already orbit, so the
-   * third finger is what buys the viewport a dedicated pan. Finish immediately when one of the
-   * three fingers is lifted so a following two-finger gesture starts with clean state. */
+  /* Three or more fingers are intentionally ignored. The old three-finger
+   * Shift+middle-mouse simulation could release a Shift held by the customizable
+   * shortcut pad. Do not reinterpret the extra fingers as a two-finger gesture. */
   if (count >= 3) {
-    if (!touch_pan_active_) {
-      touchCancelPending();
-    }
-    float cx = 0.0f, cy = 0.0f;
-    for (int i = 0; i < 3; i++) {
-      cx += ghost_android_scale_input(AMotionEvent_getX(event, i));
-      cy += ghost_android_scale_input(AMotionEvent_getY(event, i));
-    }
-    const int32_t x = int32_t(cx / 3.0f);
-    const int32_t y = int32_t(cy / 3.0f);
-    cursor_x_ = x;
-    cursor_y_ = y;
-    pushEvent(std::make_unique<GHOST_EventCursor>(
-        getMilliSeconds(), GHOST_kEventCursorMove, window_, x, y, GHOST_TABLET_DATA_NONE));
-
-    if (action == AMOTION_EVENT_ACTION_POINTER_UP || action == AMOTION_EVENT_ACTION_UP ||
-        action == AMOTION_EVENT_ACTION_CANCEL)
-    {
-      touchEndPan();
-    }
-    else if (!touch_pan_active_) {
-      /* Shift goes down before the button: a keymap item is matched against the modifiers the
-       * press itself carries, so pressing it afterwards would still select the orbit binding. */
-      touchSendShift(true);
-      touchSendButton(GHOST_kButtonMaskMiddle, GHOST_kEventButtonDown);
-      touch_pan_active_ = true;
-    }
+    touchCancelPending();
     gesture_active_ = false;
+    gesture_kind_ = GestureKind::Undecided;
     return 1;
   }
-
-  touchEndPan();
 
   /* Two fingers: either a pan or a zoom, decided once and then held for the
    * rest of the gesture. Both used to be emitted on every frame, so the jitter
@@ -588,40 +572,6 @@ void GHOST_SystemAndroid::touchSendButton(GHOST_TButton mask, GHOST_TEventType t
   touch_button_down_ = down;
   pushEvent(std::make_unique<GHOST_EventButton>(
       getMilliSeconds(), type, window_, mask, touch_tablet_));
-}
-
-void GHOST_SystemAndroid::touchSendShift(bool down)
-{
-  if (touch_shift_active_ == down) {
-    return;
-  }
-  touch_shift_active_ = down;
-  /* The window manager re-reads getModifierKeys() on every button event (see touch_shift_active_)
-   * and injects a matching press or release whenever it disagrees with the event state, so the
-   * synthetic key event only survives if meta_state_ tells the same story. */
-  if (down) {
-    meta_state_ |= AMETA_SHIFT_ON;
-  }
-  else {
-    meta_state_ &= ~AMETA_SHIFT_ON;
-  }
-  pushEvent(std::make_unique<GHOST_EventKey>(getMilliSeconds(),
-                                             down ? GHOST_kEventKeyDown : GHOST_kEventKeyUp,
-                                             window_,
-                                             GHOST_kKeyLeftShift,
-                                             false));
-}
-
-void GHOST_SystemAndroid::touchEndPan()
-{
-  if (!touch_pan_active_) {
-    return;
-  }
-  touch_pan_active_ = false;
-  touchSendButton(GHOST_kButtonMaskMiddle, GHOST_kEventButtonUp);
-  /* Release Shift only after the button, so the release the operator is waiting for still
-   * carries the modifier its press was matched with. */
-  touchSendShift(false);
 }
 
 void GHOST_SystemAndroid::hoverExitCheck()
@@ -846,9 +796,10 @@ void GHOST_SystemAndroid::dispatchJavaKeyEvent(int32_t keycode, int32_t action, 
 
 GHOST_TSuccess GHOST_SystemAndroid::getModifierKeys(GHOST_ModifierKeys &keys) const
 {
-  const bool shift = (meta_state_ & AMETA_SHIFT_ON) != 0;
-  const bool ctrl = (meta_state_ & AMETA_CTRL_ON) != 0;
-  const bool alt = (meta_state_ & AMETA_ALT_ON) != 0;
+  const uint32_t vk_mask = g_android_virtual_modifier_mask.load(std::memory_order_relaxed);
+  const bool shift = (meta_state_ & AMETA_SHIFT_ON) != 0 || (vk_mask & 0x1u) != 0;
+  const bool ctrl = (meta_state_ & AMETA_CTRL_ON) != 0 || (vk_mask & 0x2u) != 0;
+  const bool alt = (meta_state_ & AMETA_ALT_ON) != 0 || (vk_mask & 0x4u) != 0;
   const bool os = (meta_state_ & AMETA_META_ON) != 0;
   keys.set(GHOST_kModifierKeyLeftShift, shift);
   keys.set(GHOST_kModifierKeyRightShift, shift);
