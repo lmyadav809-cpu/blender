@@ -202,12 +202,24 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+      - name: Stage APK inside GitHub workspace
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK_SOURCE="$GITHUB_WORKSPACE/../blender_build_android/android_apk_stage_lite/blender-lite.apk"
+          APK_TARGET="$GITHUB_WORKSPACE/apk-artifact/blender-lite.apk"
+          test -s "$APK_SOURCE"
+          mkdir -p "$(dirname "$APK_TARGET")"
+          cp "$APK_SOURCE" "$APK_TARGET"
+          ls -lh "$APK_TARGET"
+
       - name: Upload Blender Lite APK
         if: success()
         uses: actions/upload-artifact@v4
         with:
           name: blender-android-lite
-          path: ../blender_build_android/android_apk_stage_lite/blender-lite.apk
+          path: apk-artifact/blender-lite.apk
           if-no-files-found: error
           retention-days: 7
           
