@@ -222,7 +222,8 @@ struct VKPlacedKey {
   rcti rect;
 };
 
-static const float VK_MIN_HEIGHT = 108.0f;
+/* Height of the compact strip, before Blender UI scaling. */
+static const float VK_STRIP_HEIGHT = 88.0f;
 
 struct VirtualKeyboard {
   bool open = false;
@@ -251,6 +252,7 @@ struct VirtualKeyboard {
   int cursor[2] = {0, 0};
   int pinned[2] = {0, 0};
   int drag_prev[2] = {0, 0};
+  int press_size[2] = {0, 0};
 };
 
 static VirtualKeyboard g_vk;
@@ -535,22 +537,27 @@ static void vk_build_layout(VirtualKeyboard &vk, wmWindow *win)
 {
   const int win_w = win->sizex, win_h = win->sizey;
   if (win_w <= 0 || win_h <= 0) {
+    vk.keys.clear();
     return;
   }
+
   int band_bottom, band_top;
   vk_drawable_band(win, &band_bottom, &band_top);
   const float scale = vk_scale();
   const bool portrait = win_w < win_h;
-  const int columns = portrait ? 4 : 7;
+
+  /* Normal and assignment-editing modes use exactly one row of 14 slots.
+   * Only the separate key-choice picker uses multiple rows to keep its many choices legible. */
+  const int columns = vk.picking ? (portrait ? 4 : 7) : VK_SLOT_COUNT;
   const int rows = (VK_SLOT_COUNT + columns - 1) / columns;
-  const float band_h = float(band_top - band_bottom);
-  const float panel_width = min_ff(float(win_w) * (portrait ? 0.94f : 0.80f),
-                                   (portrait ? 480.0f : 840.0f) * scale);
-  const float height = min_ff(
-      band_h,
-      max_ff(VK_MIN_HEIGHT * scale,
-             min_ff(float(win_h) * (portrait ? 0.28f : 0.36f),
-                    (portrait ? 300.0f : 194.0f) * scale)));
+  const float band_h = max_ff(1.0f, float(band_top - band_bottom));
+  const float margin = min_ff(float(win_w) * 0.01f, max_ff(3.0f, 7.0f * scale));
+  const float panel_width = max_ff(1.0f, float(win_w) - 2.0f * margin);
+  const float height = vk.picking ?
+                           min_ff(band_h,
+                                  max_ff(100.0f * scale,
+                                         min_ff(float(win_h) * 0.35f, 190.0f * scale))) :
+                           min_ff(band_h, VK_STRIP_HEIGHT * min_ff(scale, 1.8f));
   const float room = max_ff(0.0f, band_h - height);
   vk.offset = clamp_f(vk.offset, 0.0f, room);
   const float x0 = (float(win_w) - panel_width) * 0.5f;
@@ -558,13 +565,17 @@ static void vk_build_layout(VirtualKeyboard &vk, wmWindow *win)
   vk.rect = {int(x0), int(x0 + panel_width), int(y0), int(y0 + height)};
   vk.keys.clear();
 
-  const float pad = max_ff(3.0f, 5.0f * scale);
-  const float gap = max_ff(2.0f, 4.0f * scale);
-  const float header_h = clamp_f(height * 0.22f, 26.0f * scale, 38.0f * scale);
+  /* Keep gaps small so all fourteen keys remain onscreen even on narrower displays. */
+  const float ui_scale = min_ff(scale, 1.8f);
+  const float pad = min_ff(panel_width * 0.02f, max_ff(2.0f, 3.0f * ui_scale));
+  const float gap = min_ff(panel_width / 120.0f, max_ff(1.0f, 2.0f * ui_scale));
+  const float header_h = min_ff(height * 0.42f,
+                                max_ff(23.0f, min_ff(30.0f * ui_scale, height * 0.38f)));
   const float header_y = y0 + height - header_h - pad;
-  const float header_w = clamp_f(header_h * 1.25f, 32.0f * scale, 55.0f * scale);
+  const float header_w = min_ff(panel_width / 10.0f,
+                               max_ff(24.0f, header_h * 1.25f));
 
-  /* Keep the original indices of Close [0] and Move [1] for the status text. */
+  /* Keep Close and Move first: the status renderer relies on these indices. */
   vk_place(vk, &vk_spec_close, x0 + panel_width - pad - header_w, header_y, header_w, header_h);
   vk_place(vk, &vk_spec_move, x0 + pad, header_y, header_w, header_h);
   float right = x0 + panel_width - pad - header_w - gap;
@@ -589,10 +600,12 @@ static void vk_build_layout(VirtualKeyboard &vk, wmWindow *win)
   }
 
   const float main_y = y0 + pad;
-  const float main_h = max_ff(20.0f, header_y - gap - main_y);
-  const float key_width = (panel_width - 2.0f * pad - float(columns - 1) * gap) /
-                          float(columns);
-  const float key_height = (main_h - float(rows - 1) * gap) / float(rows);
+  const float main_h = max_ff(1.0f, header_y - gap - main_y);
+  const float key_width = max_ff(1.0f,
+                                 (panel_width - 2.0f * pad - float(columns - 1) * gap) /
+                                     float(columns));
+  const float key_height = max_ff(1.0f,
+                                  (main_h - float(rows - 1) * gap) / float(rows));
 
   for (int index = 0; index < VK_SLOT_COUNT; index++) {
     VKKeySpec *spec;
@@ -865,7 +878,7 @@ static void vk_draw_cb(const wmWindow *win, void * /*customdata*/)
     const float available_w = float(BLI_rcti_size_x(&key.rect)) - 6.0f;
     float text_w = BLF_width(font_id, label, label_len);
     if (text_w > available_w && text_w > 0.0f) {
-      BLF_size(font_id, max_ff(8.0f, size * available_w / text_w));
+      BLF_size(font_id, max_ff(7.0f, size * available_w / text_w));
       text_w = BLF_width(font_id, label, label_len);
     }
     const float x = float(key.rect.xmin) + (float(BLI_rcti_size_x(&key.rect)) - text_w) * 0.5f;
@@ -1047,22 +1060,6 @@ static void vk_release_all_slots(VirtualKeyboard &vk, wmWindowManager *wm, wmWin
   }
 }
 
-/* On reopening, clear modifiers stranded by an interrupted Android gesture. */
-static void vk_release_stuck_mods(wmWindowManager *wm, wmWindow *win)
-{
-  const int held = (win->runtime->eventstate != nullptr) ?
-                       win->runtime->eventstate->modifier : 0;
-  if (held & KM_CTRL) {
-    vk_send_ghost_key(wm, win, GHOST_kKeyLeftControl, nullptr, false);
-  }
-  if (held & KM_SHIFT) {
-    vk_send_ghost_key(wm, win, GHOST_kKeyLeftShift, nullptr, false);
-  }
-  if (held & KM_ALT) {
-    vk_send_ghost_key(wm, win, GHOST_kKeyLeftAlt, nullptr, false);
-  }
-}
-
 /* -------------------------------------------------------------------- */
 /** \name Open and close
  * \{ */
@@ -1102,7 +1099,6 @@ static void vk_open(wmWindowManager *wm, wmWindow *win)
   if (!vk.loaded) {
     vk_load(vk);
   }
-  vk_release_stuck_mods(wm, win);
   vk.open = true;
   vk.win = win;
   vk.offset = 0.0f;
@@ -1115,7 +1111,13 @@ static void vk_open(wmWindowManager *wm, wmWindow *win)
   vk.hover = -1;
   vk.pressed = -1;
   vk.moving = false;
-  copy_v2_v2_int(vk.pinned, win->runtime->eventstate->xy);
+  if (win->runtime->eventstate != nullptr) {
+    copy_v2_v2_int(vk.pinned, win->runtime->eventstate->xy);
+  }
+  else {
+    vk.pinned[0] = win->sizex / 2;
+    vk.pinned[1] = win->sizey / 2;
+  }
   vk_build_layout(vk, win);
   vk.draw_handle = WM_draw_cb_activate(win, vk_draw_cb, nullptr);
   vk_tag_redraw(win);
@@ -1154,7 +1156,7 @@ bool WM_virtual_keyboard_rect_get(const wmWindow *win, rcti *r_rect)
 void WM_virtual_keyboard_toggle(wmWindowManager *wm, wmWindow *win)
 {
   if (g_vk.open) {
-    vk_close(wm, win);
+    vk_close(wm, g_vk.win);
   }
   else {
     vk_open(wm, win);
@@ -1189,6 +1191,8 @@ void wm_virtual_keyboard_window_close(wmWindow *win)
 static void vk_press(VirtualKeyboard &vk, wmWindow *win, int index)
 {
   vk.pressed = index;
+  vk.press_size[0] = win->sizex;
+  vk.press_size[1] = win->sizey;
   vk.moving = (index != -1) && (vk.keys[index].spec->kind == VKKind::Move);
   copy_v2_v2_int(vk.drag_prev, vk.cursor);
   vk_tag_redraw(win);
@@ -1216,7 +1220,9 @@ static void vk_release(VirtualKeyboard &vk, wmWindowManager *wm, wmWindow *win)
   const bool was_moving = vk.moving;
   vk.pressed = -1;
   vk.moving = false;
-  if (index == -1) {
+  if (index < 0 || index >= int(vk.keys.size()) ||
+      vk.press_size[0] != win->sizex || vk.press_size[1] != win->sizey)
+  {
     vk_tag_redraw(win);
     return;
   }
@@ -1280,6 +1286,13 @@ static void vk_release(VirtualKeyboard &vk, wmWindowManager *wm, wmWindow *win)
           for (int i = 0; i < 2; i++) {
             slot.keys[i] = i < slot.count ? vk.pending[i] : GHOST_kKeyUnknown;
           }
+          if (slot.count == 2 && !vk_is_modifier(slot.keys[0]) &&
+              vk_is_modifier(slot.keys[1]))
+          {
+            const GHOST_TKey first = slot.keys[0];
+            slot.keys[0] = slot.keys[1];
+            slot.keys[1] = first;
+          }
           vk_slot_label(slot);
           vk.save_failed = !vk_save(vk);
         }
@@ -1335,6 +1348,9 @@ bool wm_virtual_keyboard_ghost_event(wmWindowManager *wm,
   switch (type) {
     case GHOST_kEventWindowDeactivate:
       vk_release_all_slots(vk, wm, win);
+      vk.pressed = -1;
+      vk.moving = false;
+      vk.hover = -1;
       vk_tag_redraw(win);
       return false;
     case GHOST_kEventCursorMove: {
