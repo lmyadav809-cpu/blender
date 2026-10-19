@@ -1,0 +1,223 @@
+name: Blender Android Full
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      ANDROID_NDK_VERSION: "30.0.14904198-beta1"
+      JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+      GIT_TERMINAL_PROMPT: "0"
+      GIT_LFS_SKIP_SMUDGE: "1"
+
+    steps:
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/share/powershell
+          sudo apt-get clean
+          df -h
+
+      - name: Checkout Android source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          lfs: false
+          submodules: false
+
+      - name: Install build tools and Linux input libraries
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential gcc-14 g++-14 cmake ninja-build \
+            patchelf pkg-config zip unzip git-lfs file \
+            openjdk-17-jdk python3 curl \
+            libjpeg-dev libpng-dev zlib1g-dev libtiff-dev \
+            libx11-dev libxext-dev libxrender-dev libxfixes-dev \
+            libxi-dev libxcursor-dev libxrandr-dev \
+            libxinerama-dev libxxf86vm-dev libxt-dev \
+            libegl-dev
+          cmake --version
+          gcc-14 --version
+          java -version
+          echo "Checking native Linux input/display libraries"
+          pkg-config --modversion xi xcursor xrandr xinerama
+          test -f /usr/include/X11/extensions/XInput2.h
+          echo "Host X11 tablet/input development headers verified"
+
+      - name: Install Android SDK
+        shell: bash
+        run: |
+          set -e
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" \
+            "platform-tools" "build-tools;35.0.1" "platforms;android-35"
+          test -f "$ANDROID_HOME/platforms/android-35/android.jar"
+
+      - name: Install NDK r30 beta1
+        shell: bash
+        run: |
+          set -euo pipefail
+          NDK_PATH="$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION"
+          mkdir -p "$ANDROID_HOME/ndk"
+          if [ ! -f "$NDK_PATH/source.properties" ]; then
+            curl -fL --retry 3 \
+              "https://dl.google.com/android/repository/android-ndk-r30-beta1-linux.zip" \
+              -o "$RUNNER_TEMP/android-ndk.zip"
+            echo "26b746e5a1e7ac3371f2a862a2f52a7c0740aa8a  $RUNNER_TEMP/android-ndk.zip" \
+              | sha1sum -c -
+            mkdir -p "$RUNNER_TEMP/ndk-unpacked"
+            unzip -q "$RUNNER_TEMP/android-ndk.zip" \
+              -d "$RUNNER_TEMP/ndk-unpacked"
+            PROPERTIES=$(find "$RUNNER_TEMP/ndk-unpacked" \
+              -maxdepth 3 -type f -name source.properties -print -quit)
+            test -n "$PROPERTIES"
+            grep -Fqx "Pkg.Revision = $ANDROID_NDK_VERSION" "$PROPERTIES"
+            mv "$(dirname "$PROPERTIES")" "$NDK_PATH"
+            rm -f "$RUNNER_TEMP/android-ndk.zip"
+          fi
+          test -f "$NDK_PATH/build/cmake/android.toolchain.cmake"
+          test -x "$NDK_PATH/ndk-build"
+          echo "NDK installed: $NDK_PATH"
+
+      - name: Align SDK path with Simfeo build scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          INSTALLED_SDK="$ANDROID_HOME"
+          EXPECTED_SDK="$HOME/android-sdk"
+          if [ "$(realpath -m "$INSTALLED_SDK")" != "$(realpath -m "$EXPECTED_SDK")" ]; then
+            if [ -e "$EXPECTED_SDK" ] && [ ! -L "$EXPECTED_SDK" ]; then
+              echo "ERROR: $EXPECTED_SDK exists and is not a symlink"
+              exit 1
+            fi
+            ln -sfn "$INSTALLED_SDK" "$EXPECTED_SDK"
+          fi
+          test -f "$EXPECTED_SDK/ndk/$ANDROID_NDK_VERSION/build/cmake/android.toolchain.cmake"
+          echo "ANDROID_HOME=$EXPECTED_SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$EXPECTED_SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$EXPECTED_SDK/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$EXPECTED_SDK/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
+          echo "SDK path verified: $EXPECTED_SDK"
+          df -h
+
+      - name: Fetch Blender source LFS
+        run: |
+          set -e
+          git lfs install --local
+          git config lfs.url \
+            https://projects.blender.org/blender/blender.git/info/lfs
+          git config --local credential.https://projects.blender.org.helper \
+            '!f() { echo username=; echo password=; }; f'
+          git lfs pull
+
+      - name: Fetch and hydrate Linux host libraries
+        run: |
+          set -euo pipefail
+          git -c 'submodule.lib/linux_x64.update=checkout' \
+            submodule update --init --progress lib/linux_x64
+          git -C lib/linux_x64 lfs install --local
+          git -C lib/linux_x64 config --local \
+            credential.https://projects.blender.org.helper \
+            '!f() { echo username=; echo password=; }; f'
+          git -C lib/linux_x64 lfs pull
+          TBB=lib/linux_x64/tbb/lib/libtbbmalloc.so
+          test -e "$TBB"
+          file -L "$TBB"
+          if ! file -L "$TBB" | grep -q 'ELF 64-bit'; then
+            echo "ERROR: TBB is not an ELF binary"
+            exit 1
+          fi
+          du -sh lib/linux_x64
+          df -h
+
+      - name: Fetch and hydrate Android ARM64 libraries
+        run: |
+          set -euo pipefail
+          git -c 'submodule.lib/android_arm64.update=checkout' \
+            submodule update --init --progress lib/android_arm64
+          git -C lib/android_arm64 lfs install --local
+          git -C lib/android_arm64 config --local \
+            credential.https://projects.blender.org.helper \
+            '!f() { echo username=; echo password=; }; f'
+          git -C lib/android_arm64 lfs pull
+          du -sh lib/android_arm64
+          df -h
+
+      - name: Install Vulkan headers
+        run: |
+          set -e
+          VER="1.4.341"
+          curl -fL --retry 3 -o "$RUNNER_TEMP/vulkan.tar.gz" \
+            "https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v${VER}.tar.gz"
+          tar -xzf "$RUNNER_TEMP/vulkan.tar.gz" -C "$RUNNER_TEMP"
+          mkdir -p ../blender_build_android/lib/vulkan_headers
+          cp -R "$RUNNER_TEMP/Vulkan-Headers-${VER}/include" \
+            ../blender_build_android/lib/vulkan_headers/include
+          rm -f "$RUNNER_TEMP/vulkan.tar.gz"
+
+      - name: Verify Android toolchain and host libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f build_files/android/build.py
+          test -f build_files/android/env.sh
+          test -d lib/linux_x64/tbb/lib
+          test -d lib/android_arm64
+          test -f "$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION/build/cmake/android.toolchain.cmake"
+          pkg-config --exists xi xcursor xrandr xinerama
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          bash -lc 'set -e; source build_files/android/env.sh; echo "Simfeo toolchain: $ANDROID_TOOLCHAIN_FILE"; test -f "$ANDROID_TOOLCHAIN_FILE"'
+          df -h
+          free -h
+
+      - name: Build Blender Android Full
+        shell: bash
+        run: |
+          set -o pipefail
+          python3 build_files/android/build.py full 2>&1 | tee build-full.log
+          RESULT=${PIPESTATUS[0]}
+          if [ "$RESULT" -ne 0 ]; then
+            echo "===== BUILD FAILURE SUMMARY ====="
+            grep -n -B 5 -A 6 -E \
+              'CMake Error|Could NOT find|fatal error:|FAILED:|Error:|No space left|file format not recognized' \
+              build-full.log | tail -n 180 || true
+            exit "$RESULT"
+          fi
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: blender-full-build-diagnostics
+          path: build-full.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Stage APK inside GitHub workspace
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK_SOURCE="$GITHUB_WORKSPACE/../blender_build_android/android_apk_stage_full/blender-full.apk"
+          APK_TARGET="$GITHUB_WORKSPACE/apk-artifact-full/blender-full.apk"
+          test -s "$APK_SOURCE"
+          mkdir -p "$(dirname "$APK_TARGET")"
+          cp "$APK_SOURCE" "$APK_TARGET"
+          ls -lh "$APK_TARGET"
+
+      - name: Upload Blender Full APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: blender-android-full
+          path: apk-artifact-full/blender-full.apk
+          if-no-files-found: error
+          retention-days: 7
