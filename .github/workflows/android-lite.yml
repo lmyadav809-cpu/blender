@@ -1,0 +1,85 @@
+name: Blender Android Lite
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    env:
+      ANDROID_NDK_VERSION: 30.0.14904198-beta1
+      JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+      GIT_TERMINAL_PROMPT: "0"
+
+    steps:
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/share/powershell
+          sudo apt-get clean
+          df -h
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          lfs: false
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc-14 g++-14 cmake ninja-build \
+            patchelf zip unzip git-lfs \
+            openjdk-17-jdk python3
+          cmake --version
+          gcc-14 --version
+
+      - name: Install Android NDK and SDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            --channel=3 \
+            "ndk;30.0.14904198-beta1" \
+            "platform-tools" \
+            "build-tools;35.0.1" \
+            "platforms;android-35"
+
+      - name: Fetch Blender LFS files
+        run: |
+          git lfs install --local
+          git config lfs.url https://projects.blender.org/blender/blender.git/info/lfs
+          git config --local credential.https://projects.blender.org.helper \
+            '!f() { echo username=; echo password=; }; f'
+          git lfs pull
+
+      - name: Fetch Blender dependencies
+        run: |
+          git submodule update --init lib/linux_x64
+          git submodule update --init lib/android_arm64
+          df -h
+
+      - name: Install Vulkan headers
+        run: |
+          VER=1.4.341
+          curl -fL --retry 3 -o /tmp/vh.tar.gz \
+            "https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v${VER}.tar.gz"
+          tar -xzf /tmp/vh.tar.gz -C /tmp
+          mkdir -p ../blender_build_android/lib/vulkan_headers
+          cp -R "/tmp/Vulkan-Headers-${VER}/include" \
+            ../blender_build_android/lib/vulkan_headers/include
+
+      - name: Build unchanged Blender Lite
+        run: |
+          python3 build_files/android/build.py lite
+
+      - name: Upload Lite APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: blender-android-lite
+          path: ../blender_build_android/android_apk_stage_lite/blender-lite.apk
+          if-no-files-found: error
