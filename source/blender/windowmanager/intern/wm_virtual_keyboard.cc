@@ -7,9 +7,8 @@
  *
  * On-screen keyboard for touch devices.
  *
- * A phone has no keyboard, and the platform one can only type: it cannot press Ctrl, it cannot
- * send a numpad view key, and it covers half the screen while doing neither. This one is drawn by
- * Blender, spans the whole window, and turns a tap into a real key event.
+ * Compact, configurable 14-slot touch shortcut pad for Blender Android.
+ * Tapping a slot toggles its assigned key(s) down/up; slots may share held keys.
  *
  * Why it lives here rather than in an add-on
  * ------------------------------------------
@@ -32,7 +31,10 @@
  */
 
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <optional>
+#include <string>
 
 #include "GHOST_ISystem.hh"
 
@@ -55,6 +57,7 @@
 
 #include "BLF_api.hh"
 
+#include "BKE_appdir.hh"
 #include "BKE_context.hh"
 #include "BKE_screen.hh"
 
@@ -72,382 +75,312 @@
 
 namespace blender {
 
-/* -------------------------------------------------------------------- */
-/** \name Key tables
- *
- * A row is a list of keys whose widths add up to the same number of units, so the columns line up
- * whatever the window is doing. Text keys carry the characters they produce, plain and shifted;
- * everything else carries none and is recognized by its key code alone.
- * \{ */
+/* Compact Android shortcut pad. All catalog keys can be assigned to any of 14 slots. */
+static constexpr int VK_SLOT_COUNT = 14;
+static constexpr int VK_PICK_PAGE_SIZE = 14;
 
 enum class VKKind {
-  Key,
-  Mod,
-  /**
-   * Caps Lock, which is not a modifier and is deliberately not one of the slots below.
-   *
-   * Those three are mirrored into the window's real modifier state, and #vk_sync_ghost_mods reads
-   * that state back to correct itself. Caps has no counterpart there -- it changes which character
-   * a letter types and nothing else -- so a bit for it in the same mask would be a bit the sync
-   * could never find on the other side.
-   */
-  Caps,
-  Layer,
+  Slot,
+  Pick,
   Close,
   Move,
-};
-
-/* Modifier slots, in the order they are shown. */
-enum {
-  VK_MOD_CTRL = 0,
-  VK_MOD_SHIFT = 1,
-  VK_MOD_ALT = 2,
-  VK_MOD_NUM = 3,
+  Edit,
+  Done,
+  Save,
+  Cancel,
+  Clear,
+  Reset,
+  Prev,
+  Next,
 };
 
 struct VKKeySpec {
   const char *label;
   VKKind kind;
-  /** #GHOST_TKey for #VKKind::Key, a `VK_MOD_*` slot for #VKKind::Mod, a layer for the rest. */
   int code;
+};
+
+struct VKChoice {
+  const char *label;
+  GHOST_TKey key;
   const char *utf8;
-  const char *utf8_shift;
-  float units;
+  const char *shifted;
 };
 
-#define VK_KEY(label, key, text, text_shift, units) \
-  { \
-    label, VKKind::Key, int(key), text, text_shift, units \
+/* Display labels are short so that combinations fit on narrow touch keys. */
+static const VKChoice vk_choices[] = {
+    {"Ctrl", GHOST_kKeyLeftControl, nullptr, nullptr},
+    {"Shift", GHOST_kKeyLeftShift, nullptr, nullptr},
+    {"Alt", GHOST_kKeyLeftAlt, nullptr, nullptr},
+    {"Esc", GHOST_kKeyEsc, nullptr, nullptr},
+    {"Tab", GHOST_kKeyTab, nullptr, nullptr},
+    {"Space", GHOST_kKeySpace, " ", " "},
+    {"Enter", GHOST_kKeyEnter, nullptr, nullptr},
+    {"Bksp", GHOST_kKeyBackSpace, nullptr, nullptr},
+    {"Del", GHOST_kKeyDelete, nullptr, nullptr},
+    {"Left", GHOST_kKeyLeftArrow, nullptr, nullptr},
+    {"Right", GHOST_kKeyRightArrow, nullptr, nullptr},
+    {"Up", GHOST_kKeyUpArrow, nullptr, nullptr},
+    {"Down", GHOST_kKeyDownArrow, nullptr, nullptr},
+    {"Home", GHOST_kKeyHome, nullptr, nullptr},
+    {"End", GHOST_kKeyEnd, nullptr, nullptr},
+    {"PgUp", GHOST_kKeyUpPage, nullptr, nullptr},
+    {"PgDn", GHOST_kKeyDownPage, nullptr, nullptr},
+    {"Ins", GHOST_kKeyInsert, nullptr, nullptr},
+    {"A", GHOST_kKeyA, "a", "A"},
+    {"B", GHOST_kKeyB, "b", "B"},
+    {"C", GHOST_kKeyC, "c", "C"},
+    {"D", GHOST_kKeyD, "d", "D"},
+    {"E", GHOST_kKeyE, "e", "E"},
+    {"F", GHOST_kKeyF, "f", "F"},
+    {"G", GHOST_kKeyG, "g", "G"},
+    {"H", GHOST_kKeyH, "h", "H"},
+    {"I", GHOST_kKeyI, "i", "I"},
+    {"J", GHOST_kKeyJ, "j", "J"},
+    {"K", GHOST_kKeyK, "k", "K"},
+    {"L", GHOST_kKeyL, "l", "L"},
+    {"M", GHOST_kKeyM, "m", "M"},
+    {"N", GHOST_kKeyN, "n", "N"},
+    {"O", GHOST_kKeyO, "o", "O"},
+    {"P", GHOST_kKeyP, "p", "P"},
+    {"Q", GHOST_kKeyQ, "q", "Q"},
+    {"R", GHOST_kKeyR, "r", "R"},
+    {"S", GHOST_kKeyS, "s", "S"},
+    {"T", GHOST_kKeyT, "t", "T"},
+    {"U", GHOST_kKeyU, "u", "U"},
+    {"V", GHOST_kKeyV, "v", "V"},
+    {"W", GHOST_kKeyW, "w", "W"},
+    {"X", GHOST_kKeyX, "x", "X"},
+    {"Y", GHOST_kKeyY, "y", "Y"},
+    {"Z", GHOST_kKeyZ, "z", "Z"},
+    {"0", GHOST_kKey0, "0", ")"},
+    {"1", GHOST_kKey1, "1", "!"},
+    {"2", GHOST_kKey2, "2", "@"},
+    {"3", GHOST_kKey3, "3", "#"},
+    {"4", GHOST_kKey4, "4", "$"},
+    {"5", GHOST_kKey5, "5", "%"},
+    {"6", GHOST_kKey6, "6", "^"},
+    {"7", GHOST_kKey7, "7", "&"},
+    {"8", GHOST_kKey8, "8", "*"},
+    {"9", GHOST_kKey9, "9", "("},
+    {"F1", GHOST_kKeyF1, nullptr, nullptr},
+    {"F2", GHOST_kKeyF2, nullptr, nullptr},
+    {"F3", GHOST_kKeyF3, nullptr, nullptr},
+    {"F4", GHOST_kKeyF4, nullptr, nullptr},
+    {"F5", GHOST_kKeyF5, nullptr, nullptr},
+    {"F6", GHOST_kKeyF6, nullptr, nullptr},
+    {"F7", GHOST_kKeyF7, nullptr, nullptr},
+    {"F8", GHOST_kKeyF8, nullptr, nullptr},
+    {"F9", GHOST_kKeyF9, nullptr, nullptr},
+    {"F10", GHOST_kKeyF10, nullptr, nullptr},
+    {"F11", GHOST_kKeyF11, nullptr, nullptr},
+    {"F12", GHOST_kKeyF12, nullptr, nullptr},
+    {"Num0", GHOST_kKeyNumpad0, "0", "0"},
+    {"Num1", GHOST_kKeyNumpad1, "1", "1"},
+    {"Num2", GHOST_kKeyNumpad2, "2", "2"},
+    {"Num3", GHOST_kKeyNumpad3, "3", "3"},
+    {"Num4", GHOST_kKeyNumpad4, "4", "4"},
+    {"Num5", GHOST_kKeyNumpad5, "5", "5"},
+    {"Num6", GHOST_kKeyNumpad6, "6", "6"},
+    {"Num7", GHOST_kKeyNumpad7, "7", "7"},
+    {"Num8", GHOST_kKeyNumpad8, "8", "8"},
+    {"Num9", GHOST_kKeyNumpad9, "9", "9"},
+    {"Num+", GHOST_kKeyNumpadPlus, "+", "+"},
+    {"Num-", GHOST_kKeyNumpadMinus, "-", "-"},
+    {"Minus", GHOST_kKeyMinus, "-", "_"},
+    {"Equal", GHOST_kKeyEqual, "=", "+"},
+    {"Comma", GHOST_kKeyComma, ",", "<"},
+    {"Period", GHOST_kKeyPeriod, ".", ">"},
+    {"Slash", GHOST_kKeySlash, "/", "?"},
+    {"Semi", GHOST_kKeySemicolon, ";", ":"},
+    {"Quote", GHOST_kKeyQuote, "'", "\""},
+    {"[", GHOST_kKeyLeftBracket, "[", "{"},
+    {"]", GHOST_kKeyRightBracket, "]", "}"},
+    {"Backslash", GHOST_kKeyBackslash, "\\", "|"},
+};
+
+static const VKChoice *vk_choice_for_key(const GHOST_TKey key)
+{
+  for (const VKChoice &choice : vk_choices) {
+    if (choice.key == key) {
+      return &choice;
+    }
   }
-#define VK_PLAIN(label, key, units) \
-  { \
-    label, VKKind::Key, int(key), nullptr, nullptr, units \
-  }
-#define VK_MOD(label, slot, units) \
-  { \
-    label, VKKind::Mod, slot, nullptr, nullptr, units \
-  }
-#define VK_LAYER(label, layer, units) \
-  { \
-    label, VKKind::Layer, layer, nullptr, nullptr, units \
-  }
-#define VK_CAPS(label, units) \
-  { \
-    label, VKKind::Caps, 0, nullptr, nullptr, units \
-  }
+  return nullptr;
+}
 
-/* Letters, the number row and the function row: the block that is always shown.
- *
- * Every row totals 14 units, which is what makes the columns line up down the keyboard. Change a
- * width here and the row it is in has to give the same amount back somewhere else, or that row
- * alone comes out staggered against the rest. */
-
-/* Touch: Esc at the head of the function row, where a desktop keyboard puts it.
- *
- * F1 opens the manual for whatever is under the cursor, F2 renames, F3 searches, F9 reopens the
- * last operator's panel, F11 and F12 render. On a desktop each of those is one key; without this
- * row a phone has no way to reach any of them at all. Esc came up from the head of the letters,
- * which is where a real keyboard has Tab -- and that freed the space the rows below now spend on
- * the brackets and punctuation that writing a script needs. */
-static const VKKeySpec vk_row_function[] = {
-    VK_PLAIN("Esc", GHOST_kKeyEsc, 2.0f),
-    VK_PLAIN("F1", GHOST_kKeyF1, 1.0f),
-    VK_PLAIN("F2", GHOST_kKeyF2, 1.0f),
-    VK_PLAIN("F3", GHOST_kKeyF3, 1.0f),
-    VK_PLAIN("F4", GHOST_kKeyF4, 1.0f),
-    VK_PLAIN("F5", GHOST_kKeyF5, 1.0f),
-    VK_PLAIN("F6", GHOST_kKeyF6, 1.0f),
-    VK_PLAIN("F7", GHOST_kKeyF7, 1.0f),
-    VK_PLAIN("F8", GHOST_kKeyF8, 1.0f),
-    VK_PLAIN("F9", GHOST_kKeyF9, 1.0f),
-    VK_PLAIN("F10", GHOST_kKeyF10, 1.0f),
-    VK_PLAIN("F11", GHOST_kKeyF11, 1.0f),
-    VK_PLAIN("F12", GHOST_kKeyF12, 1.0f),
+struct VKSlot {
+  GHOST_TKey keys[2] = {GHOST_kKeyUnknown, GHOST_kKeyUnknown};
+  int count = 0;
+  bool active = false;
+  char label[40] = "";
 };
 
-static const VKKeySpec vk_row_digits[] = {
-    VK_KEY("`", GHOST_kKeyAccentGrave, "`", "~", 1.0f),
-    VK_KEY("1", GHOST_kKey1, "1", "!", 1.0f),
-    VK_KEY("2", GHOST_kKey2, "2", "@", 1.0f),
-    VK_KEY("3", GHOST_kKey3, "3", "#", 1.0f),
-    VK_KEY("4", GHOST_kKey4, "4", "$", 1.0f),
-    VK_KEY("5", GHOST_kKey5, "5", "%", 1.0f),
-    VK_KEY("6", GHOST_kKey6, "6", "^", 1.0f),
-    VK_KEY("7", GHOST_kKey7, "7", "&", 1.0f),
-    VK_KEY("8", GHOST_kKey8, "8", "*", 1.0f),
-    VK_KEY("9", GHOST_kKey9, "9", "(", 1.0f),
-    VK_KEY("0", GHOST_kKey0, "0", ")", 1.0f),
-    VK_KEY("-", GHOST_kKeyMinus, "-", "_", 1.0f),
-    VK_KEY("=", GHOST_kKeyEqual, "=", "+", 1.0f),
-    VK_PLAIN("Bksp", GHOST_kKeyBackSpace, 1.0f),
-};
-
-static const VKKeySpec vk_row_q[] = {
-    VK_PLAIN("Tab", GHOST_kKeyTab, 1.0f),
-    VK_KEY("Q", GHOST_kKeyQ, "q", "Q", 1.0f),
-    VK_KEY("W", GHOST_kKeyW, "w", "W", 1.0f),
-    VK_KEY("E", GHOST_kKeyE, "e", "E", 1.0f),
-    VK_KEY("R", GHOST_kKeyR, "r", "R", 1.0f),
-    VK_KEY("T", GHOST_kKeyT, "t", "T", 1.0f),
-    VK_KEY("Y", GHOST_kKeyY, "y", "Y", 1.0f),
-    VK_KEY("U", GHOST_kKeyU, "u", "U", 1.0f),
-    VK_KEY("I", GHOST_kKeyI, "i", "I", 1.0f),
-    VK_KEY("O", GHOST_kKeyO, "o", "O", 1.0f),
-    VK_KEY("P", GHOST_kKeyP, "p", "P", 1.0f),
-    VK_KEY("[", GHOST_kKeyLeftBracket, "[", "{", 1.0f),
-    VK_KEY("]", GHOST_kKeyRightBracket, "]", "}", 1.0f),
-    VK_KEY("\\", GHOST_kKeyBackslash, "\\", "|", 1.0f),
-};
-
-static const VKKeySpec vk_row_a[] = {
-    VK_CAPS("Caps", 1.5f),
-    VK_KEY("A", GHOST_kKeyA, "a", "A", 1.0f),
-    VK_KEY("S", GHOST_kKeyS, "s", "S", 1.0f),
-    VK_KEY("D", GHOST_kKeyD, "d", "D", 1.0f),
-    VK_KEY("F", GHOST_kKeyF, "f", "F", 1.0f),
-    VK_KEY("G", GHOST_kKeyG, "g", "G", 1.0f),
-    VK_KEY("H", GHOST_kKeyH, "h", "H", 1.0f),
-    VK_KEY("J", GHOST_kKeyJ, "j", "J", 1.0f),
-    VK_KEY("K", GHOST_kKeyK, "k", "K", 1.0f),
-    VK_KEY("L", GHOST_kKeyL, "l", "L", 1.0f),
-    VK_KEY(";", GHOST_kKeySemicolon, ";", ":", 1.0f),
-    VK_KEY("'", GHOST_kKeyQuote, "'", "\"", 1.0f),
-    VK_PLAIN("Enter", GHOST_kKeyEnter, 1.5f),
-};
-
-static const VKKeySpec vk_row_z[] = {
-    VK_MOD("Shift", VK_MOD_SHIFT, 2.0f),
-    VK_KEY("Z", GHOST_kKeyZ, "z", "Z", 1.0f),
-    VK_KEY("X", GHOST_kKeyX, "x", "X", 1.0f),
-    VK_KEY("C", GHOST_kKeyC, "c", "C", 1.0f),
-    VK_KEY("V", GHOST_kKeyV, "v", "V", 1.0f),
-    VK_KEY("B", GHOST_kKeyB, "b", "B", 1.0f),
-    VK_KEY("N", GHOST_kKeyN, "n", "N", 1.0f),
-    VK_KEY("M", GHOST_kKeyM, "m", "M", 1.0f),
-    VK_KEY(",", GHOST_kKeyComma, ",", "<", 1.0f),
-    VK_KEY(".", GHOST_kKeyPeriod, ".", ">", 1.0f),
-    VK_KEY("/", GHOST_kKeySlash, "/", "?", 1.0f),
-    VK_PLAIN("Del", GHOST_kKeyDelete, 2.0f),
-};
-
-static const VKKeySpec vk_row_space[] = {
-    VK_MOD("Ctrl", VK_MOD_CTRL, 1.5f),
-    VK_MOD("Alt", VK_MOD_ALT, 1.5f),
-    VK_KEY("Space", GHOST_kKeySpace, " ", " ", 6.0f),
-    VK_PLAIN("←", GHOST_kKeyLeftArrow, 1.0f),
-    VK_PLAIN("↓", GHOST_kKeyDownArrow, 1.0f),
-    VK_PLAIN("↑", GHOST_kKeyUpArrow, 1.0f),
-    VK_PLAIN("→", GHOST_kKeyRightArrow, 1.0f),
-    VK_LAYER("123", 1, 1.0f),
-};
-
-/* The numeric block beside the letters in landscape. Blender maps the numpad to view angles, so
- * these emit numpad keys on purpose and not the number row.
- *
- * Six rows, matching the letters beside it: the two blocks are placed into the same height, so a
- * block with fewer rows comes out with taller keys than its neighbour. Every row here totals 4
- * units for the same reason the letters all total 14. */
-static const VKKeySpec vk_pad_row_top[] = {
-    VK_PLAIN("PgUp", GHOST_kKeyUpPage, 1.0f),
-    VK_PLAIN("PgDn", GHOST_kKeyDownPage, 1.0f),
-    VK_PLAIN("Ins", GHOST_kKeyInsert, 1.0f),
-    VK_PLAIN("Del", GHOST_kKeyDelete, 1.0f),
-};
-static const VKKeySpec vk_pad_row0[] = {
-    VK_KEY("/", GHOST_kKeyNumpadSlash, "/", "/", 1.0f),
-    VK_KEY("*", GHOST_kKeyNumpadAsterisk, "*", "*", 1.0f),
-    VK_KEY("-", GHOST_kKeyNumpadMinus, "-", "-", 1.0f),
-    VK_KEY("+", GHOST_kKeyNumpadPlus, "+", "+", 1.0f),
-};
-static const VKKeySpec vk_pad_row1[] = {
-    VK_KEY("7", GHOST_kKeyNumpad7, "7", "7", 1.0f),
-    VK_KEY("8", GHOST_kKeyNumpad8, "8", "8", 1.0f),
-    VK_KEY("9", GHOST_kKeyNumpad9, "9", "9", 1.0f),
-    VK_PLAIN("Bksp", GHOST_kKeyBackSpace, 1.0f),
-};
-static const VKKeySpec vk_pad_row2[] = {
-    VK_KEY("4", GHOST_kKeyNumpad4, "4", "4", 1.0f),
-    VK_KEY("5", GHOST_kKeyNumpad5, "5", "5", 1.0f),
-    VK_KEY("6", GHOST_kKeyNumpad6, "6", "6", 1.0f),
-    VK_PLAIN("⏎", GHOST_kKeyNumpadEnter, 1.0f),
-};
-static const VKKeySpec vk_pad_row3[] = {
-    VK_KEY("1", GHOST_kKeyNumpad1, "1", "1", 1.0f),
-    VK_KEY("2", GHOST_kKeyNumpad2, "2", "2", 1.0f),
-    VK_KEY("3", GHOST_kKeyNumpad3, "3", "3", 1.0f),
-    VK_PLAIN("Home", GHOST_kKeyHome, 1.0f),
-};
-static const VKKeySpec vk_pad_row4[] = {
-    VK_KEY("0", GHOST_kKeyNumpad0, "0", "0", 2.0f),
-    VK_KEY(".", GHOST_kKeyNumpadPeriod, ".", ".", 1.0f),
-    VK_PLAIN("End", GHOST_kKeyEnd, 1.0f),
-};
-
-/* Portrait has no room for a side block, so the same keys become a layer. Six rows here as well,
- * so switching between the two layers does not change the height of every key underneath the
- * thumb that switched them. The extra row is the bracket and quote block: they are on the letter
- * layer too, but reaching them from the numbers otherwise means two layer switches. */
-static const VKKeySpec vk_num_row_sym[] = {
-    VK_KEY("[", GHOST_kKeyLeftBracket, "[", "{", 1.0f),
-    VK_KEY("]", GHOST_kKeyRightBracket, "]", "}", 1.0f),
-    VK_KEY("\\", GHOST_kKeyBackslash, "\\", "|", 1.0f),
-    VK_KEY(";", GHOST_kKeySemicolon, ";", ":", 1.0f),
-    VK_KEY("'", GHOST_kKeyQuote, "'", "\"", 1.0f),
-};
-static const VKKeySpec vk_num_row0[] = {
-    VK_KEY("7", GHOST_kKeyNumpad7, "7", "7", 1.0f),
-    VK_KEY("8", GHOST_kKeyNumpad8, "8", "8", 1.0f),
-    VK_KEY("9", GHOST_kKeyNumpad9, "9", "9", 1.0f),
-    VK_KEY("/", GHOST_kKeyNumpadSlash, "/", "/", 1.0f),
-    VK_PLAIN("Bksp", GHOST_kKeyBackSpace, 1.0f),
-};
-static const VKKeySpec vk_num_row1[] = {
-    VK_KEY("4", GHOST_kKeyNumpad4, "4", "4", 1.0f),
-    VK_KEY("5", GHOST_kKeyNumpad5, "5", "5", 1.0f),
-    VK_KEY("6", GHOST_kKeyNumpad6, "6", "6", 1.0f),
-    VK_KEY("*", GHOST_kKeyNumpadAsterisk, "*", "*", 1.0f),
-    VK_PLAIN("⏎", GHOST_kKeyNumpadEnter, 1.0f),
-};
-static const VKKeySpec vk_num_row2[] = {
-    VK_KEY("1", GHOST_kKeyNumpad1, "1", "1", 1.0f),
-    VK_KEY("2", GHOST_kKeyNumpad2, "2", "2", 1.0f),
-    VK_KEY("3", GHOST_kKeyNumpad3, "3", "3", 1.0f),
-    VK_KEY("-", GHOST_kKeyNumpadMinus, "-", "-", 1.0f),
-    VK_PLAIN("↑", GHOST_kKeyUpArrow, 1.0f),
-};
-static const VKKeySpec vk_num_row3[] = {
-    VK_KEY("0", GHOST_kKeyNumpad0, "0", "0", 2.0f),
-    VK_KEY(".", GHOST_kKeyNumpadPeriod, ".", ".", 1.0f),
-    VK_KEY("+", GHOST_kKeyNumpadPlus, "+", "+", 1.0f),
-    VK_PLAIN("↓", GHOST_kKeyDownArrow, 1.0f),
-};
-static const VKKeySpec vk_num_row4[] = {
-    VK_LAYER("ABC", 0, 1.0f),
-    VK_MOD("Ctrl", VK_MOD_CTRL, 1.0f),
-    VK_MOD("Shift", VK_MOD_SHIFT, 1.0f),
-    VK_MOD("Alt", VK_MOD_ALT, 1.0f),
-    VK_PLAIN("Esc", GHOST_kKeyEsc, 1.0f),
-};
-
-#undef VK_KEY
-#undef VK_PLAIN
-#undef VK_MOD
-#undef VK_LAYER
-
-struct VKRow {
-  const VKKeySpec *keys;
-  int keys_num;
-};
-
-#define VK_ROW(array) \
-  { \
-    array, ARRAY_SIZE(array) \
-  }
-
-/* All three blocks are six rows deep. Two of them share a height in landscape, and the other two
- * swap places in portrait, so a block that is one row shorter than its neighbour shows it. */
-static const VKRow vk_main_rows[] = {
-    VK_ROW(vk_row_function),
-    VK_ROW(vk_row_digits),
-    VK_ROW(vk_row_q),
-    VK_ROW(vk_row_a),
-    VK_ROW(vk_row_z),
-    VK_ROW(vk_row_space),
-};
-static const VKRow vk_pad_rows[] = {
-    VK_ROW(vk_pad_row_top),
-    VK_ROW(vk_pad_row0),
-    VK_ROW(vk_pad_row1),
-    VK_ROW(vk_pad_row2),
-    VK_ROW(vk_pad_row3),
-    VK_ROW(vk_pad_row4),
-};
-static const VKRow vk_number_rows[] = {
-    VK_ROW(vk_num_row_sym),
-    VK_ROW(vk_num_row0),
-    VK_ROW(vk_num_row1),
-    VK_ROW(vk_num_row2),
-    VK_ROW(vk_num_row3),
-    VK_ROW(vk_num_row4),
-};
-
-#undef VK_ROW
-
-/** \} */
-
-/* -------------------------------------------------------------------- */
-/** \name State
- * \{ */
-
+/* Placed keys point into the stable spec arrays owned by the singleton. */
 struct VKPlacedKey {
   const VKKeySpec *spec;
   rcti rect;
 };
 
-/** Never build a keyboard shorter than this, before the drawable band clamps it. */
-static const float VK_MIN_HEIGHT = 150.0f;
+static const float VK_MIN_HEIGHT = 108.0f;
 
 struct VirtualKeyboard {
   bool open = false;
   wmWindow *win = nullptr;
   void *draw_handle = nullptr;
-
-  /** The panel, in window coordinates. */
   rcti rect = {0, 0, 0, 0};
-  /** How far the panel has been slid up from the bottom of the drawable band. */
   float offset = 0.0f;
-  /** 0 letters, 1 numbers. Only used in portrait; landscape shows both at once. */
-  int layer = 0;
-
-  /**
-   * The modifiers that are on, which is to say held down.
-   *
-   * They latch: tapping one turns it on and it stays on until it is tapped again. That is not
-   * how it started -- a tapped modifier used to clear after the next key -- and the difference
-   * is the whole point. Growing a face selection means Ctrl and NumpadPlus a dozen times, and
-   * re-tapping Ctrl before every one of them is what made it not worth doing.
-   *
-   * Shift is the exception, and only for keys that type: it clears after a letter or a digit, so
-   * typing a capital does not leave the next letter capital too. Ctrl and Alt never do that,
-   * because nothing types with them.
-   */
-  uint8_t mods = 0;
-
-  /**
-   * Caps Lock, kept out of #mods on purpose: see #VKKind::Caps.
-   *
-   * It exists because a latched Shift is cleared by the first character it types, which is right
-   * for one capital and useless for a word of them. Caps is the one that stays. It reaches letters
-   * only, the way the key on a real keyboard does, so it does not turn 1 into !.
-   */
-  bool caps = false;
-
+  VKSlot slots[VK_SLOT_COUNT];
+  VKKeySpec slot_specs[VK_SLOT_COUNT] = {};
+  VKKeySpec picker_specs[VK_PICK_PAGE_SIZE] = {};
+  bool loaded = false;
+  bool editing = false;
+  bool picking = false;
+  int selected_slot = -1;
+  int picker_page = 0;
+  GHOST_TKey pending[2] = {GHOST_kKeyUnknown, GHOST_kKeyUnknown};
+  int pending_count = 0;
+  bool save_failed = false;
   Vector<VKPlacedKey> keys;
-
-  /**
-   * The string of the native text field being edited, read live so the bar shows what is in the
-   * field even while the keyboard covers it. Null whenever nothing is being edited.
-   */
   const char *const *text_edit = nullptr;
-  /** The last key sent and when, for the moment of feedback the bar gives after a tap. */
   char last_key[64] = "";
   double last_key_time = 0.0;
-
   int hover = -1;
   int pressed = -1;
   bool moving = false;
-
-  /** Last pointer position, in window coordinates. */
   int cursor[2] = {0, 0};
-  /** Last position that was outside the keyboard, which injected events are attributed to. */
   int pinned[2] = {0, 0};
   int drag_prev[2] = {0, 0};
 };
 
-/* Android hands out exactly one window, and a second keyboard would have nothing to attach to. */
 static VirtualKeyboard g_vk;
 
-/** The interface resolution scale, which the keyboard sizes its text and its bar against. */
+static void vk_slot_label(VKSlot &slot)
+{
+  if (slot.count == 0) {
+    BLI_strncpy(slot.label, "Empty", sizeof(slot.label));
+    return;
+  }
+  const VKChoice *first = vk_choice_for_key(slot.keys[0]);
+  const VKChoice *second = (slot.count == 2) ? vk_choice_for_key(slot.keys[1]) : nullptr;
+  if (first == nullptr || (slot.count == 2 && second == nullptr)) {
+    BLI_strncpy(slot.label, "Invalid", sizeof(slot.label));
+    return;
+  }
+  if (second != nullptr) {
+    BLI_snprintf(slot.label, sizeof(slot.label), "%s+%s", first->label, second->label);
+  }
+  else {
+    BLI_strncpy(slot.label, first->label, sizeof(slot.label));
+  }
+}
+
+static void vk_default_slots(VirtualKeyboard &vk)
+{
+  const GHOST_TKey defaults[VK_SLOT_COUNT][2] = {
+      {GHOST_kKeyLeftShift, GHOST_kKeyUnknown},
+      {GHOST_kKeyLeftControl, GHOST_kKeyUnknown},
+      {GHOST_kKeyLeftAlt, GHOST_kKeyUnknown},
+      {GHOST_kKeyG, GHOST_kKeyUnknown},
+      {GHOST_kKeyR, GHOST_kKeyUnknown},
+      {GHOST_kKeyS, GHOST_kKeyUnknown},
+      {GHOST_kKeyE, GHOST_kKeyUnknown},
+      {GHOST_kKeyF, GHOST_kKeyUnknown},
+      {GHOST_kKeyTab, GHOST_kKeyUnknown},
+      {GHOST_kKeyLeftControl, GHOST_kKeyD},
+      {GHOST_kKeyLeftShift, GHOST_kKeyD},
+      {GHOST_kKeyLeftControl, GHOST_kKeyZ},
+      {GHOST_kKeyEsc, GHOST_kKeyUnknown},
+      {GHOST_kKeyX, GHOST_kKeyUnknown},
+  };
+  for (int i = 0; i < VK_SLOT_COUNT; i++) {
+    vk.slots[i].keys[0] = defaults[i][0];
+    vk.slots[i].keys[1] = defaults[i][1];
+    vk.slots[i].count = (defaults[i][1] == GHOST_kKeyUnknown) ? 1 : 2;
+    vk.slots[i].active = false;
+    vk_slot_label(vk.slots[i]);
+  }
+}
+
+/* Blender's existing user-config location is app-private on Android. */
+static std::optional<std::string> vk_config_path(const bool create)
+{
+  const std::optional<std::string> directory = create ?
+      BKE_appdir_folder_id_create(BLENDER_USER_CONFIG, nullptr) :
+      BKE_appdir_folder_id(BLENDER_USER_CONFIG, nullptr);
+  if (!directory) {
+    return std::nullopt;
+  }
+  return *directory + "/android_custom_keyboard_v1.txt";
+}
+
+static bool vk_save(VirtualKeyboard &vk)
+{
+  const std::optional<std::string> path = vk_config_path(true);
+  if (!path) {
+    return false;
+  }
+  const std::string temp_path = *path + ".tmp";
+  FILE *file = std::fopen(temp_path.c_str(), "wb");
+  if (file == nullptr) {
+    return false;
+  }
+  bool ok = std::fprintf(file, "VK14 1\n") > 0;
+  for (const VKSlot &slot : vk.slots) {
+    ok &= std::fprintf(file, "%d %d %d\n", slot.count, int(slot.keys[0]), int(slot.keys[1])) > 0;
+  }
+  ok &= (std::fclose(file) == 0);
+  if (!ok || std::rename(temp_path.c_str(), path->c_str()) != 0) {
+    std::remove(temp_path.c_str());
+    return false;
+  }
+  return true;
+}
+
+static void vk_load(VirtualKeyboard &vk)
+{
+  vk_default_slots(vk);
+  vk.loaded = true;
+  const std::optional<std::string> path = vk_config_path(false);
+  if (!path) {
+    return;
+  }
+  FILE *file = std::fopen(path->c_str(), "rb");
+  if (file == nullptr) {
+    return;
+  }
+  char signature[16] = "";
+  int version = 0;
+  VKSlot loaded[VK_SLOT_COUNT] = {};
+  bool ok = std::fscanf(file, "%15s %d", signature, &version) == 2 &&
+            STREQ(signature, "VK14") && version == 1;
+  for (int i = 0; ok && i < VK_SLOT_COUNT; i++) {
+    int n = -1, a = -1, b = -1;
+    if (std::fscanf(file, "%d %d %d", &n, &a, &b) != 3 || n < 0 || n > 2) {
+      ok = false;
+      break;
+    }
+    const GHOST_TKey ka = GHOST_TKey(a);
+    const GHOST_TKey kb = GHOST_TKey(b);
+    if ((n >= 1 && vk_choice_for_key(ka) == nullptr) ||
+        (n == 2 && (ka == kb || vk_choice_for_key(kb) == nullptr)))
+    {
+      ok = false;
+      break;
+    }
+    loaded[i].count = n;
+    loaded[i].keys[0] = n >= 1 ? ka : GHOST_kKeyUnknown;
+    loaded[i].keys[1] = n == 2 ? kb : GHOST_kKeyUnknown;
+    vk_slot_label(loaded[i]);
+  }
+  std::fclose(file);
+  if (ok) {
+    for (int i = 0; i < VK_SLOT_COUNT; i++) {
+      vk.slots[i] = loaded[i];
+    }
+  }
+}
+
 static float vk_scale()
 {
   return (U.scale_factor > 0.0f) ? U.scale_factor : 1.0f;
@@ -455,15 +388,11 @@ static float vk_scale()
 
 static void vk_tag_redraw(wmWindow *win)
 {
-  /* The overlay is painted while the window is composited, so it is enough to ask for that rather
-   * than to tag every region and make the editors redraw themselves. */
   bScreen *screen = WM_window_get_active_screen(win);
   if (screen) {
     screen->do_draw = true;
   }
 }
-
-/** \} */
 
 /* -------------------------------------------------------------------- */
 /** \name Layout
@@ -578,157 +507,112 @@ static void vk_target_position(const VirtualKeyboard &vk, const wmWindow *win, i
   }
 }
 
-static void vk_place_row(Vector<VKPlacedKey> &keys,
-                         const VKRow &row,
-                         float x,
-                         float y,
-                         float width,
-                         float height,
-                         float gap)
-{
-  float total = 0.0f;
-  for (int i = 0; i < row.keys_num; i++) {
-    total += row.keys[i].units;
-  }
-  if (total <= 0.0f) {
-    return;
-  }
-  const float usable = width - gap * float(row.keys_num - 1);
-  float cursor = x;
-  for (int i = 0; i < row.keys_num; i++) {
-    const float w = usable * (row.keys[i].units / total);
-    VKPlacedKey placed;
-    placed.spec = &row.keys[i];
-    placed.rect.xmin = int(cursor);
-    placed.rect.xmax = int(cursor + w);
-    placed.rect.ymin = int(y);
-    placed.rect.ymax = int(y + height);
-    keys.append(placed);
-    cursor += w + gap;
-  }
-}
+static const VKKeySpec vk_spec_close = {"X", VKKind::Close, 0};
+static const VKKeySpec vk_spec_move = {"Move", VKKind::Move, 0};
+static const VKKeySpec vk_spec_edit = {"Edit", VKKind::Edit, 0};
+static const VKKeySpec vk_spec_done = {"Done", VKKind::Done, 0};
+static const VKKeySpec vk_spec_save = {"Save", VKKind::Save, 0};
+static const VKKeySpec vk_spec_cancel = {"Back", VKKind::Cancel, 0};
+static const VKKeySpec vk_spec_clear = {"Clear", VKKind::Clear, 0};
+static const VKKeySpec vk_spec_reset = {"Reset", VKKind::Reset, 0};
+static const VKKeySpec vk_spec_prev = {"<", VKKind::Prev, 0};
+static const VKKeySpec vk_spec_next = {">", VKKind::Next, 0};
 
-static void vk_place_block(Vector<VKPlacedKey> &keys,
-                           const VKRow *rows,
-                           int rows_num,
-                           float x,
-                           float y,
-                           float width,
-                           float height,
-                           float gap)
+static void vk_place(VirtualKeyboard &vk,
+                     const VKKeySpec *spec,
+                     const float x,
+                     const float y,
+                     const float w,
+                     const float h)
 {
-  const float row_h = (height - gap * float(rows_num - 1)) / float(rows_num);
-  float cursor = y + height - row_h;
-  for (int i = 0; i < rows_num; i++) {
-    vk_place_row(keys, rows[i], x, cursor, width, row_h, gap);
-    cursor -= row_h + gap;
-  }
+  VKPlacedKey placed;
+  placed.spec = spec;
+  placed.rect = {int(x), int(x + w), int(y), int(y + h)};
+  vk.keys.append(placed);
 }
-
-/* Two keys the layout owns rather than the tables: they exist only while the keyboard is up. */
-static const VKKeySpec vk_spec_close = {"✕", VKKind::Close, 0, nullptr, nullptr, 1.0f};
-static const VKKeySpec vk_spec_move = {"↕", VKKind::Move, 0, nullptr, nullptr, 1.0f};
 
 static void vk_build_layout(VirtualKeyboard &vk, wmWindow *win)
 {
-  const int win_w = win->sizex;
-  const int win_h = win->sizey;
+  const int win_w = win->sizex, win_h = win->sizey;
   if (win_w <= 0 || win_h <= 0) {
     return;
   }
-
   int band_bottom, band_top;
   vk_drawable_band(win, &band_bottom, &band_top);
-  const float band_h = float(band_top - band_bottom);
-
   const float scale = vk_scale();
   const bool portrait = win_w < win_h;
-
-  /* A share of the window rather than of the band between the areas, so that a rotation really
-   * recomputes it. Landscape takes the larger share on purpose: the window is short, and the share
-   * that suits a tall one leaves rows too thin to hit and labels too small to read. */
-  const float fraction = portrait ? 0.32f : 0.45f;
-
-  float height = float(win_h) * fraction;
-  height = min_ff(height, band_h * 0.9f);
-  height = max_ff(height, min_ff(VK_MIN_HEIGHT * scale, band_h));
-  height = min_ff(height, band_h);
-
+  const int columns = portrait ? 4 : 7;
+  const int rows = (VK_SLOT_COUNT + columns - 1) / columns;
+  const float band_h = float(band_top - band_bottom);
+  const float panel_width = min_ff(float(win_w) * (portrait ? 0.94f : 0.80f),
+                                   (portrait ? 480.0f : 840.0f) * scale);
+  const float height = min_ff(
+      band_h,
+      max_ff(VK_MIN_HEIGHT * scale,
+             min_ff(float(win_h) * (portrait ? 0.28f : 0.36f),
+                    (portrait ? 300.0f : 194.0f) * scale)));
   const float room = max_ff(0.0f, band_h - height);
   vk.offset = clamp_f(vk.offset, 0.0f, room);
-  const float base = float(band_bottom) + vk.offset;
-
-  vk.rect.xmin = 0;
-  vk.rect.xmax = win_w;
-  vk.rect.ymin = int(base);
-  vk.rect.ymax = int(base + height);
-
-  const float pad = max_ff(4.0f, height * 0.022f);
-  const float gap = max_ff(2.0f, height * 0.013f);
-
+  const float x0 = (float(win_w) - panel_width) * 0.5f;
+  const float y0 = float(band_bottom) + vk.offset;
+  vk.rect = {int(x0), int(x0 + panel_width), int(y0), int(y0 + height)};
   vk.keys.clear();
 
-  /* The bar along the top carries the handle and the close button. Bounded rather than scaled with
-   * the keyboard: a tall portrait keyboard turned it into a banner, while it only has to stay
-   * large enough to hit. */
-  const float bar_h = clamp_f(height * 0.10f, 28.0f * scale, 44.0f * scale);
-  const float bar_y = base + height - pad - bar_h;
+  const float pad = max_ff(3.0f, 5.0f * scale);
+  const float gap = max_ff(2.0f, 4.0f * scale);
+  const float header_h = clamp_f(height * 0.22f, 26.0f * scale, 38.0f * scale);
+  const float header_y = y0 + height - header_h - pad;
+  const float header_w = clamp_f(header_h * 1.25f, 32.0f * scale, 55.0f * scale);
 
-  /* Both bar buttons are square, so the handle reads as a button rather than as a rail. */
-  const float button_w = bar_h;
-
-  VKPlacedKey close_key;
-  close_key.spec = &vk_spec_close;
-  close_key.rect.xmax = int(float(win_w) - pad);
-  close_key.rect.xmin = int(float(win_w) - pad - button_w);
-  close_key.rect.ymin = int(bar_y);
-  close_key.rect.ymax = int(bar_y + bar_h);
-  vk.keys.append(close_key);
-
-  VKPlacedKey move_key;
-  move_key.spec = &vk_spec_move;
-  move_key.rect.xmin = int(pad);
-  move_key.rect.xmax = int(pad + button_w);
-  move_key.rect.ymin = int(bar_y);
-  move_key.rect.ymax = int(bar_y + bar_h);
-  vk.keys.append(move_key);
-
-  const float keys_top = bar_y - gap;
-  const float keys_h = max_ff(60.0f, keys_top - (base + pad));
-
-  if (!portrait) {
-    const float pad_w = min_ff(float(win_w) * 0.27f, keys_h * 1.05f);
-    const float main_w = float(win_w) - pad * 2.0f - pad_w - gap * 2.0f;
-    vk_place_block(
-        vk.keys, vk_main_rows, ARRAY_SIZE(vk_main_rows), pad, base + pad, main_w, keys_h, gap);
-    vk_place_block(vk.keys,
-                   vk_pad_rows,
-                   ARRAY_SIZE(vk_pad_rows),
-                   pad + main_w + gap * 2.0f,
-                   base + pad,
-                   pad_w,
-                   keys_h,
-                   gap);
+  /* Keep the original indices of Close [0] and Move [1] for the status text. */
+  vk_place(vk, &vk_spec_close, x0 + panel_width - pad - header_w, header_y, header_w, header_h);
+  vk_place(vk, &vk_spec_move, x0 + pad, header_y, header_w, header_h);
+  float right = x0 + panel_width - pad - header_w - gap;
+  auto add_button = [&](const VKKeySpec *spec) {
+    right -= header_w;
+    vk_place(vk, spec, right, header_y, header_w, header_h);
+    right -= gap;
+  };
+  if (vk.picking) {
+    add_button(&vk_spec_save);
+    add_button(&vk_spec_cancel);
+    add_button(&vk_spec_next);
+    add_button(&vk_spec_prev);
+    add_button(&vk_spec_clear);
   }
-  else if (vk.layer == 1) {
-    vk_place_block(vk.keys,
-                   vk_number_rows,
-                   ARRAY_SIZE(vk_number_rows),
-                   pad,
-                   base + pad,
-                   float(win_w) - pad * 2.0f,
-                   keys_h,
-                   gap);
+  else if (vk.editing) {
+    add_button(&vk_spec_done);
+    add_button(&vk_spec_reset);
   }
   else {
-    vk_place_block(vk.keys,
-                   vk_main_rows,
-                   ARRAY_SIZE(vk_main_rows),
-                   pad,
-                   base + pad,
-                   float(win_w) - pad * 2.0f,
-                   keys_h,
-                   gap);
+    add_button(&vk_spec_edit);
+  }
+
+  const float main_y = y0 + pad;
+  const float main_h = max_ff(20.0f, header_y - gap - main_y);
+  const float key_width = (panel_width - 2.0f * pad - float(columns - 1) * gap) /
+                          float(columns);
+  const float key_height = (main_h - float(rows - 1) * gap) / float(rows);
+
+  for (int index = 0; index < VK_SLOT_COUNT; index++) {
+    VKKeySpec *spec;
+    if (vk.picking) {
+      const int choice_index = vk.picker_page * VK_PICK_PAGE_SIZE + index;
+      if (choice_index >= int(ARRAY_SIZE(vk_choices))) {
+        break;
+      }
+      vk.picker_specs[index] = {vk_choices[choice_index].label, VKKind::Pick, choice_index};
+      spec = &vk.picker_specs[index];
+    }
+    else {
+      vk.slot_specs[index] = {vk.slots[index].label, VKKind::Slot, index};
+      spec = &vk.slot_specs[index];
+    }
+    const int col = index % columns;
+    const int row = index / columns;
+    const float x = x0 + pad + float(col) * (key_width + gap);
+    const float y = main_y + float(rows - 1 - row) * (key_height + gap);
+    vk_place(vk, spec, x, y, key_width, key_height);
   }
 }
 
@@ -848,9 +732,14 @@ static const float VK_COL_TEXT_DIM[4] = {0.6f, 0.6f, 0.6f, 1.0f};
 /** The character Shift is offering, shown in place of the usual one. */
 static const float VK_COL_TEXT_SHIFT[4] = {0.45f, 0.68f, 1.0f, 1.0f};
 
-static bool vk_mod_is_on(const VirtualKeyboard &vk, int slot)
+static bool vk_picker_is_pending(const VirtualKeyboard &vk, const GHOST_TKey key)
 {
-  return (vk.mods & (1 << slot)) != 0;
+  for (int i = 0; i < vk.pending_count; i++) {
+    if (vk.pending[i] == key) {
+      return true;
+    }
+  }
+  return false;
 }
 
 static const float *vk_cap_color(const VirtualKeyboard &vk, int index)
@@ -864,147 +753,49 @@ static const float *vk_cap_color(const VirtualKeyboard &vk, int index)
       return VK_COL_CAP_CLOSE;
     case VKKind::Move:
       return vk.moving ? VK_COL_CAP_PRESS : VK_COL_CAP_MOVE;
-    case VKKind::Mod:
-      /* Touch: the lock colour, because on is now always a lock -- a modifier stays down until it
-       * is tapped off. Worth being loud about: a Ctrl left on by accident changes what every
-       * other key does. */
-      if (vk_mod_is_on(vk, spec->code)) {
-        return VK_COL_CAP_LOCK;
-      }
+    case VKKind::Slot:
+      return (vk.slots[spec->code].active ||
+              (vk.editing && !vk.picking && vk.selected_slot == spec->code)) ?
+                 VK_COL_CAP_LOCK : VK_COL_CAP;
+    case VKKind::Pick:
+      return vk_picker_is_pending(vk, vk_choices[spec->code].key) ?
+                 VK_COL_CAP_LOCK : VK_COL_CAP;
+    default:
       return VK_COL_CAP_MOD;
-    case VKKind::Caps:
-      return vk.caps ? VK_COL_CAP_LOCK : VK_COL_CAP_MOD;
-    case VKKind::Layer:
-      return VK_COL_CAP_MOD;
-    case VKKind::Key:
-      break;
   }
-  return VK_COL_CAP;
 }
 
-/** A key whose character is a single lowercase letter, which is all Caps Lock reaches. */
-static bool vk_key_is_letter(const VKKeySpec &spec)
-{
-  return spec.utf8 != nullptr && spec.utf8[0] >= 'a' && spec.utf8[0] <= 'z' &&
-         spec.utf8[1] == '\0';
-}
-
-/** Whether this key would type its shifted character right now. */
-static bool vk_shift_for_key(const VirtualKeyboard &vk, const VKKeySpec &spec)
-{
-  if (vk_mod_is_on(vk, VK_MOD_SHIFT)) {
-    return true;
-  }
-  return vk.caps && vk_key_is_letter(spec);
-}
-
-/**
- * The label a key shows right now.
- *
- * With Shift on, a key that types shows the character it will actually produce rather than the one
- * it usually does, and the caller draws it in blue. The alternative was printing both characters
- * on every cap the way a physical keyboard does, which at this size means two glyphs where one is
- * already small: swapping keeps every label in the same place and the same size, and turns the
- * question "what does Shift give me here" into something the keyboard answers by itself.
- *
- * Caps deliberately does not do this. It only reaches letters, whose caps already read as capitals,
- * so there would be nothing to swap and nothing to say.
- */
-static const char *vk_key_label(const VirtualKeyboard &vk, const VKKeySpec &spec, bool *r_shifted)
+static const char *vk_key_label(const VirtualKeyboard & /*vk*/,
+                                const VKKeySpec &spec,
+                                bool *r_shifted)
 {
   *r_shifted = false;
-  if (spec.utf8 == nullptr || spec.utf8_shift == nullptr) {
-    return spec.label;
-  }
-  if (!vk_mod_is_on(vk, VK_MOD_SHIFT)) {
-    return spec.label;
-  }
-  /* Space and the numpad carry the same character either way; there is no second one to show. */
-  if (STREQ(spec.utf8, spec.utf8_shift)) {
-    return spec.label;
-  }
-  /* Nor do the letters, whose caps are already printed as capitals: Shift on Q gives the Q that is
-   * drawn on it. Compared against the label rather than against the unshifted character for
-   * exactly this reason -- the two differ ("q" against "Q") while what the key shows does not, and
-   * colouring those would turn the whole keyboard blue and say nothing. */
-  if (STREQ(spec.label, spec.utf8_shift)) {
-    return spec.label;
-  }
-  *r_shifted = true;
-  return spec.utf8_shift;
+  return spec.label;
 }
 
-static const char *vk_mod_name(int slot)
-{
-  switch (slot) {
-    case VK_MOD_CTRL:
-      return "Ctrl";
-    case VK_MOD_SHIFT:
-      return "Shift";
-    case VK_MOD_ALT:
-      return "Alt";
-    default:
-      return "";
-  }
-}
-
-static size_t vk_modifier_text(const VirtualKeyboard &vk, char *buf, size_t buf_size)
-{
-  buf[0] = '\0';
-  size_t offset = 0;
-  for (int slot = 0; slot < VK_MOD_NUM; slot++) {
-    if (!vk_mod_is_on(vk, slot)) {
-      continue;
-    }
-    if (offset != 0) {
-      offset += BLI_strncpy_rlen(buf + offset, " + ", buf_size - offset);
-    }
-    offset += BLI_strncpy_rlen(buf + offset, vk_mod_name(slot), buf_size - offset);
-  }
-  return offset;
-}
-
-/**
- * What the bar along the top says.
- *
- * While a native field is being edited it shows what is in the field, so typing behind the
- * keyboard is never blind; the drawing follows the tail of it once the text outgrows the bar.
- * Otherwise it names the combination that was just sent, for a moment, then the modifiers being
- * held, and finally the workspace, so the bar always says something about where keys are going.
- */
 static void vk_status_text(const VirtualKeyboard &vk,
-                           const wmWindow *win,
+                           const wmWindow * /*win*/,
                            char *buf,
                            size_t buf_size)
 {
-  if (vk.text_edit != nullptr && *vk.text_edit != nullptr) {
-    char mods[64];
-    if (vk_modifier_text(vk, mods, sizeof(mods)) != 0) {
-      BLI_snprintf(buf, buf_size, "%s + ...   %s|", mods, *vk.text_edit);
-    }
-    else {
-      BLI_snprintf(buf, buf_size, "%s|", *vk.text_edit);
-    }
-    return;
+  if (vk.picking) {
+    BLI_snprintf(buf, buf_size, "Slot %d: choose 1 or 2, Save", vk.selected_slot + 1);
   }
-
-  if (vk.last_key[0] != '\0' && (BLI_time_now_seconds() - vk.last_key_time) < 1.5) {
+  else if (vk.editing) {
+    BLI_strncpy(buf, vk.save_failed ? "Save failed" : "Tap a slot to edit", buf_size);
+  }
+  else if (vk.text_edit != nullptr && *vk.text_edit != nullptr) {
+    BLI_snprintf(buf, buf_size, "%s|", *vk.text_edit);
+  }
+  else if (vk.last_key[0] != '\0' && (BLI_time_now_seconds() - vk.last_key_time) < 1.5) {
     BLI_strncpy(buf, vk.last_key, buf_size);
-    return;
-  }
-
-  const size_t offset = vk_modifier_text(vk, buf, buf_size);
-  if (offset != 0) {
-    BLI_strncpy(buf + offset, " + ...", buf_size - offset);
-    return;
-  }
-
-  const WorkSpace *workspace = WM_window_get_active_workspace(const_cast<wmWindow *>(win));
-  if (workspace != nullptr) {
-    BLI_strncpy(buf, workspace->id.name + 2, buf_size);
   }
   else {
-    buf[0] = '\0';
+    int active = 0;
+    for (const VKSlot &slot : vk.slots) {
+      active += slot.active ? 1 : 0;
+    }
+    BLI_snprintf(buf, buf_size, "%d held - Edit to assign keys", active);
   }
 }
 
@@ -1058,27 +849,32 @@ static void vk_draw_cb(const wmWindow *win, void * /*customdata*/)
     BLF_size(font_id, size);
 
     const bool on = (i == vk.pressed) ||
-                    (key.spec->kind == VKKind::Mod && vk_mod_is_on(vk, key.spec->code)) ||
-                    (key.spec->kind == VKKind::Caps && vk.caps);
+                    (key.spec->kind == VKKind::Slot && vk.slots[key.spec->code].active) ||
+                    (key.spec->kind == VKKind::Pick &&
+                     vk_picker_is_pending(vk, vk_choices[key.spec->code].key));
 
     bool shifted = false;
     const char *label = vk_key_label(vk, *key.spec, &shifted);
-    /* Blue for the second character a key gives, and only for that: what Shift is offering has to
-     * be told apart at a glance from what the key says the rest of the time. */
+    /* Held keys use the highlighted colour; configured labels remain unchanged. */
     BLF_color4fv(font_id,
                  on          ? VK_COL_TEXT_ON :
                  shifted     ? VK_COL_TEXT_SHIFT :
                                VK_COL_TEXT);
 
     const size_t label_len = strlen(label);
-    const float text_w = BLF_width(font_id, label, label_len);
+    const float available_w = float(BLI_rcti_size_x(&key.rect)) - 6.0f;
+    float text_w = BLF_width(font_id, label, label_len);
+    if (text_w > available_w && text_w > 0.0f) {
+      BLF_size(font_id, max_ff(8.0f, size * available_w / text_w));
+      text_w = BLF_width(font_id, label, label_len);
+    }
     const float x = float(key.rect.xmin) + (float(BLI_rcti_size_x(&key.rect)) - text_w) * 0.5f;
     const float y = float(key.rect.ymin) + (cap_h - size) * 0.5f + size * 0.12f;
     BLF_position(font_id, x, y, 0.0f);
     BLF_draw(font_id, label, label_len);
   }
 
-  /* The bar between the handle and the close button. */
+  /* Draw the action status between the drag handle and menu buttons. */
   {
     char status[512];
     vk_status_text(vk, win, status, sizeof(status));
@@ -1091,8 +887,16 @@ static void vk_draw_cb(const wmWindow *win, void * /*customdata*/)
     BLF_size(font_id, size);
     BLF_color4fv(font_id, (vk.text_edit != nullptr) ? VK_COL_TEXT_ON : VK_COL_TEXT_DIM);
 
-    const float text_x = float(handle.rect.xmax) + bar_h * 0.5f;
-    const float avail = float(close.rect.xmin) - bar_h * 0.5f - text_x;
+    const float text_x = float(handle.rect.xmax) + bar_h * 0.25f;
+    float status_right = float(close.rect.xmin) - bar_h * 0.3f;
+    for (const VKPlacedKey &button : vk.keys) {
+      if (button.spec->kind != VKKind::Slot && button.spec->kind != VKKind::Pick &&
+          button.spec->kind != VKKind::Move && button.spec->kind != VKKind::Close)
+      {
+        status_right = min_ff(status_right, float(button.rect.xmin) - 3.0f);
+      }
+    }
+    const float avail = max_ff(0.0f, status_right - text_x);
 
     /* Follow the end of the text once it no longer fits, so what was just typed stays visible and
      * nothing ever runs under the close button. */
@@ -1118,28 +922,6 @@ static void vk_draw_cb(const wmWindow *win, void * /*customdata*/)
 /** \name Sending keys
  * \{ */
 
-static GHOST_TKey vk_modifier_ghost_key(int slot)
-{
-  switch (slot) {
-    case VK_MOD_CTRL:
-      return GHOST_kKeyLeftControl;
-    case VK_MOD_SHIFT:
-      return GHOST_kKeyLeftShift;
-    case VK_MOD_ALT:
-      return GHOST_kKeyLeftAlt;
-    default:
-      return GHOST_kKeyUnknown;
-  }
-}
-
-/**
- * The timestamp injected keys carry.
- *
- * Stepping past the double click window every time, because tapping the same key twice in a row is
- * ordinary on a touch keyboard while two presses inside #UserDef.dbl_click_time turn the second
- * into #KM_DBL_CLICK, which almost no keymap item matches. That is what made a shortcut work one
- * tap and do nothing the next.
- */
 static uint64_t vk_event_time_ms()
 {
   static uint64_t clock = 0;
@@ -1153,147 +935,133 @@ static void vk_send_ghost_key(wmWindowManager *wm,
                               const char *utf8,
                               bool down)
 {
+  if (wm == nullptr || win == nullptr) {
+    return;
+  }
   GHOST_TEventKeyData kdata = {};
   kdata.key = key;
   kdata.is_repeat = false;
   if (down && utf8 != nullptr) {
     BLI_strncpy(kdata.utf8_buf, utf8, sizeof(kdata.utf8_buf));
   }
-  else {
-    kdata.utf8_buf[0] = '\0';
-  }
   wm_event_add_ghostevent(
       wm, win, down ? GHOST_kEventKeyDown : GHOST_kEventKeyUp, &kdata, vk_event_time_ms());
 }
 
-/**
- * Put the window manager's modifier state where #VirtualKeyboard::mods says it should be.
- *
- * One key event per modifier that changed, and then it is left alone: a modifier turned on stays
- * down until it is turned off. #wmEvent::modifier is carried forward from the event state, so
- * from that moment every event carries it -- the next key from this keyboard, and equally the
- * next touch anywhere else. That is what makes Shift and a tap on a face extend a selection, and
- * Ctrl and a tap on an object add to one.
- *
- * The one thing that undoes it from outside is wm_window_update_eventstate_modifiers(), which
- * re-reads the real modifier state from GHOST and releases anything the event state holds that
- * the hardware does not. It runs when the window is activated, on a completed drag and drop, and
- * on a button event that arrives while the window is inactive. None of those happen in the middle
- * of ordinary use, and if one does the modifier simply lets go, which is the safe direction.
- */
-static uint8_t vk_mods_from_event_state(const wmWindow *win)
+static bool vk_is_modifier(const GHOST_TKey key)
 {
-  const uint8_t held = (win->runtime->eventstate != nullptr) ?
-                           uint8_t(win->runtime->eventstate->modifier) :
-                           uint8_t(0);
-  uint8_t bits = 0;
-  if (held & KM_CTRL) {
-    bits |= uint8_t(1 << VK_MOD_CTRL);
-  }
-  if (held & KM_SHIFT) {
-    bits |= uint8_t(1 << VK_MOD_SHIFT);
-  }
-  if (held & KM_ALT) {
-    bits |= uint8_t(1 << VK_MOD_ALT);
-  }
-  return bits;
+  return ELEM(key, GHOST_kKeyLeftControl, GHOST_kKeyLeftShift, GHOST_kKeyLeftAlt);
 }
 
-static void vk_sync_ghost_mods(VirtualKeyboard &vk, wmWindowManager *wm, wmWindow *win)
+static int vk_key_owners(const VirtualKeyboard &vk, const GHOST_TKey key)
 {
-  /* Read what is actually held rather than remembering what was sent.
-   *
-   * The keyboard is not the only thing that presses a modifier. The three finger viewport pan
-   * sends Shift through GHOST as well (touchSendShift(), GHOST_SystemAndroid.cc), and anything
-   * that leaves one down -- a gesture that ended by a path that did not release it, a window
-   * activation that re-read the hardware state -- used to be invisible here.
-   *
-   * A cache of what this keyboard had sent could only ever release what this keyboard had
-   * pressed, so a Shift left down by anything else was unreachable: the caps showed it off, the
-   * sync agreed there was nothing to release, and every click in the program carried it. That is
-   * the state someone had to make a new file to escape.
-   *
-   * Asking the window instead makes this self-correcting in both directions. */
-  const uint8_t actual = vk_mods_from_event_state(win);
-  if (actual == vk.mods) {
-    return;
-  }
-  /* Press before release, so a combination is never briefly empty. */
-  for (int slot = 0; slot < VK_MOD_NUM; slot++) {
-    const uint8_t bit = uint8_t(1 << slot);
-    if ((vk.mods & bit) && !(actual & bit)) {
-      vk_send_ghost_key(wm, win, vk_modifier_ghost_key(slot), nullptr, true);
+  int owners = 0;
+  for (const VKSlot &slot : vk.slots) {
+    if (!slot.active) {
+      continue;
+    }
+    for (int i = 0; i < slot.count; i++) {
+      if (slot.keys[i] == key) {
+        owners++;
+      }
     }
   }
-  for (int slot = VK_MOD_NUM - 1; slot >= 0; slot--) {
-    const uint8_t bit = uint8_t(1 << slot);
-    if (!(vk.mods & bit) && (actual & bit)) {
-      vk_send_ghost_key(wm, win, vk_modifier_ghost_key(slot), nullptr, false);
-    }
-  }
+  return owners;
 }
 
-/**
- * Let go of every modifier the window is holding, whoever pressed it.
- *
- * Called when the keyboard opens as well as when it closes, which is what makes opening it the
- * way out of a stuck modifier: a Ctrl left down with nothing on screen to turn it off changes
- * what every click in the program does, and with "Emulate 3 Button Mouse" on a stuck Alt turns
- * every tap into a middle click, which reads as the interface having died.
- */
-static void vk_release_all_mods(VirtualKeyboard &vk, wmWindowManager *wm, wmWindow *win)
+static void vk_send_key_down(VirtualKeyboard &vk,
+                             wmWindowManager *wm,
+                             wmWindow *win,
+                             GHOST_TKey key,
+                             const VKSlot &activating_slot)
 {
-  vk.mods = 0;
-  if (wm != nullptr) {
-    vk_sync_ghost_mods(vk, wm, win);
-  }
-}
-
-/**
- * Turn a tapped key into the press and release a hardware keyboard would have sent.
- *
- * The modifiers are already down by the time this runs -- see vk_sync_ghost_mods() -- so the key
- * event carries them and the keymap resolves the combination exactly as it would for a physical
- * one. They stay down afterwards, which is the difference between tapping Ctrl once and growing
- * a selection, and tapping it again before every single NumpadPlus.
- */
-static void vk_send_key(VirtualKeyboard &vk, wmWindowManager *wm, wmWindow *win, const VKKeySpec &spec)
-{
-  /* A key event inherits the cursor position, and that is what decides which editor the shortcut
-   * reaches. Attribute it to the last place the user actually touched, never to the keyboard. */
   int target[2];
   vk_target_position(vk, win, target);
-  copy_v2_v2_int(win->runtime->eventstate->xy, target);
-
-  const bool shift = vk_shift_for_key(vk, spec);
-  const char *utf8 = shift ? spec.utf8_shift : spec.utf8;
-  /* A key that types is the one case where a latched Shift is a nuisance rather than a help. */
-  const bool key_types_text = (spec.utf8 != nullptr);
-
-  /* Name it for the bar, so a tap says what it sent even when the key is under a finger. */
-  {
-    char mods[64];
-    if (vk_modifier_text(vk, mods, sizeof(mods)) != 0) {
-      BLI_snprintf(vk.last_key, sizeof(vk.last_key), "%s + %s", mods, spec.label);
-    }
-    else {
-      BLI_strncpy(vk.last_key, spec.label, sizeof(vk.last_key));
-    }
-    vk.last_key_time = BLI_time_now_seconds();
+  if (win->runtime->eventstate != nullptr) {
+    copy_v2_v2_int(win->runtime->eventstate->xy, target);
   }
+  const VKChoice *choice = vk_choice_for_key(key);
+  const char *utf8 = choice ? choice->utf8 : nullptr;
+  auto modifier_held = [&](const GHOST_TKey modifier) {
+    if (vk_key_owners(vk, modifier) > 0) {
+      return true;
+    }
+    for (int i = 0; i < activating_slot.count; i++) {
+      if (activating_slot.keys[i] == modifier) {
+        return true;
+      }
+    }
+    return false;
+  };
+  if (choice != nullptr && choice->shifted != nullptr && modifier_held(GHOST_kKeyLeftShift)) {
+    utf8 = choice->shifted;
+  }
+  if (modifier_held(GHOST_kKeyLeftControl) || modifier_held(GHOST_kKeyLeftAlt)) {
+    utf8 = nullptr;
+  }
+  vk_send_ghost_key(wm, win, key, utf8, true);
+}
 
-  vk_sync_ghost_mods(vk, wm, win);
+static void vk_set_slot_active(VirtualKeyboard &vk,
+                               wmWindowManager *wm,
+                               wmWindow *win,
+                               const int index,
+                               const bool active)
+{
+  VKSlot &slot = vk.slots[index];
+  if (slot.active == active || slot.count == 0) {
+    return;
+  }
+  if (active) {
+    /* Put modifiers first, even if they were assigned as the second key. */
+    for (int pass = 0; pass < 2; pass++) {
+      for (int i = 0; i < slot.count; i++) {
+        const GHOST_TKey key = slot.keys[i];
+        if (vk_is_modifier(key) == (pass == 0) && vk_key_owners(vk, key) == 0) {
+          vk_send_key_down(vk, wm, win, key, slot);
+        }
+      }
+    }
+    slot.active = true;
+  }
+  else {
+    /* Drop non-modifiers first, and keep shared keys until their final owner releases. */
+    slot.active = false;
+    for (int pass = 0; pass < 2; pass++) {
+      for (int i = slot.count - 1; i >= 0; i--) {
+        const GHOST_TKey key = slot.keys[i];
+        if (vk_is_modifier(key) == (pass == 1) && vk_key_owners(vk, key) == 0) {
+          vk_send_ghost_key(wm, win, key, nullptr, false);
+        }
+      }
+    }
+  }
+  BLI_strncpy(vk.last_key, slot.label, sizeof(vk.last_key));
+  vk.last_key_time = BLI_time_now_seconds();
+}
 
-  vk_send_ghost_key(wm, win, GHOST_TKey(spec.code), utf8, true);
-  vk_send_ghost_key(wm, win, GHOST_TKey(spec.code), nullptr, false);
-
-  if (key_types_text && vk_mod_is_on(vk, VK_MOD_SHIFT)) {
-    vk.mods &= uint8_t(~(1 << VK_MOD_SHIFT));
-    vk_sync_ghost_mods(vk, wm, win);
+static void vk_release_all_slots(VirtualKeyboard &vk, wmWindowManager *wm, wmWindow *win)
+{
+  for (int i = 0; i < VK_SLOT_COUNT; i++) {
+    vk_set_slot_active(vk, wm, win, i, false);
   }
 }
 
-/** \} */
+/* On reopening, clear modifiers stranded by an interrupted Android gesture. */
+static void vk_release_stuck_mods(wmWindowManager *wm, wmWindow *win)
+{
+  const int held = (win->runtime->eventstate != nullptr) ?
+                       win->runtime->eventstate->modifier : 0;
+  if (held & KM_CTRL) {
+    vk_send_ghost_key(wm, win, GHOST_kKeyLeftControl, nullptr, false);
+  }
+  if (held & KM_SHIFT) {
+    vk_send_ghost_key(wm, win, GHOST_kKeyLeftShift, nullptr, false);
+  }
+  if (held & KM_ALT) {
+    vk_send_ghost_key(wm, win, GHOST_kKeyLeftAlt, nullptr, false);
+  }
+}
 
 /* -------------------------------------------------------------------- */
 /** \name Open and close
@@ -1305,17 +1073,17 @@ static void vk_close(wmWindowManager *wm, wmWindow *win)
   if (!vk.open) {
     return;
   }
-  vk_release_all_mods(vk, wm, win);
+  vk_release_all_slots(vk, wm, win);
   if (vk.draw_handle != nullptr) {
     WM_draw_cb_exit(vk.win, vk.draw_handle);
     vk.draw_handle = nullptr;
   }
   vk.open = false;
   vk.win = nullptr;
-  /* Caps holds for as long as the keyboard is up, and no longer: coming back to a keyboard that
-   * types capitals because of a tap from an earlier session would be a puzzle with no clue on
-   * screen until the first letter arrives wrong. */
-  vk.caps = false;
+  vk.editing = false;
+  vk.picking = false;
+  vk.selected_slot = -1;
+  vk.pending_count = 0;
   vk.keys.clear();
   vk.text_edit = nullptr;
   vk.last_key[0] = '\0';
@@ -1331,17 +1099,19 @@ static void vk_open(wmWindowManager *wm, wmWindow *win)
   if (vk.open) {
     return;
   }
-  /* Opening the keyboard is the way out of a stuck modifier, whoever left it down. Nothing else
-   * on a phone can release one, and the state it produces looks like the interface has stopped
-   * responding rather than like a key being held. */
-  vk_release_all_mods(vk, wm, win);
+  if (!vk.loaded) {
+    vk_load(vk);
+  }
+  vk_release_stuck_mods(wm, win);
   vk.open = true;
   vk.win = win;
-  vk.layer = 0;
   vk.offset = 0.0f;
+  vk.editing = false;
+  vk.picking = false;
+  vk.selected_slot = -1;
+  vk.pending_count = 0;
   vk.text_edit = nullptr;
   vk.last_key[0] = '\0';
-  vk.mods = 0;
   vk.hover = -1;
   vk.pressed = -1;
   vk.moving = false;
@@ -1400,7 +1170,11 @@ void wm_virtual_keyboard_window_close(wmWindow *win)
     g_vk.win = nullptr;
     /* The window is going away and takes its event state with it, so there is nothing to
      * release the modifiers to. */
-    g_vk.mods = 0;
+    for (VKSlot &slot : g_vk.slots) {
+      slot.active = false;
+    }
+    g_vk.editing = false;
+    g_vk.picking = false;
     g_vk.keys.clear();
     g_vk.text_edit = nullptr;
   }
@@ -1420,6 +1194,22 @@ static void vk_press(VirtualKeyboard &vk, wmWindow *win, int index)
   vk_tag_redraw(win);
 }
 
+static void vk_toggle_pending(VirtualKeyboard &vk, const GHOST_TKey key)
+{
+  for (int i = 0; i < vk.pending_count; i++) {
+    if (vk.pending[i] == key) {
+      for (int j = i; j + 1 < vk.pending_count; j++) {
+        vk.pending[j] = vk.pending[j + 1];
+      }
+      vk.pending_count--;
+      return;
+    }
+  }
+  if (vk.pending_count < 2) {
+    vk.pending[vk.pending_count++] = key;
+  }
+}
+
 static void vk_release(VirtualKeyboard &vk, wmWindowManager *wm, wmWindow *win)
 {
   const int index = vk.pressed;
@@ -1430,10 +1220,7 @@ static void vk_release(VirtualKeyboard &vk, wmWindowManager *wm, wmWindow *win)
     vk_tag_redraw(win);
     return;
   }
-
   const VKKeySpec &spec = *vk.keys[index].spec;
-
-  /* A finger that slid off the key it started on cancels, as it does on any keyboard. */
   if (!was_moving && BLI_rcti_isect_pt_v(&vk.keys[index].rect, vk.cursor)) {
     switch (spec.kind) {
       case VKKind::Close:
@@ -1441,24 +1228,62 @@ static void vk_release(VirtualKeyboard &vk, wmWindowManager *wm, wmWindow *win)
         return;
       case VKKind::Move:
         break;
-      case VKKind::Layer:
-        vk.layer = spec.code;
+      case VKKind::Edit:
+        vk_release_all_slots(vk, wm, win);
+        vk.editing = true;
+        vk.picking = false;
         break;
-      case VKKind::Mod: {
-        /* Touch: a tap toggles, and it stays. Ctrl once and then NumpadPlus as many times as the
-         * selection needs; Ctrl again to let go. Two or three can be on together, and each is
-         * drawn in the lock colour while it is. */
-        vk.mods ^= uint8_t(1 << spec.code);
-        vk_sync_ghost_mods(vk, wm, win);
+      case VKKind::Done:
+        vk.editing = false;
+        vk.picking = false;
         break;
-      }
-      case VKKind::Caps:
-        /* Nothing to sync: it never reaches the window's modifier state, only the character a
-         * letter key hands over. */
-        vk.caps = !vk.caps;
+      case VKKind::Reset:
+        vk_release_all_slots(vk, wm, win);
+        vk_default_slots(vk);
+        vk.save_failed = !vk_save(vk);
         break;
-      case VKKind::Key:
-        vk_send_key(vk, wm, win, spec);
+      case VKKind::Slot:
+        if (!vk.editing) {
+          vk_set_slot_active(vk, wm, win, spec.code, !vk.slots[spec.code].active);
+        }
+        else {
+          vk.selected_slot = spec.code;
+          vk.pending_count = vk.slots[spec.code].count;
+          for (int i = 0; i < vk.pending_count; i++) {
+            vk.pending[i] = vk.slots[spec.code].keys[i];
+          }
+          vk.picker_page = 0;
+          vk.picking = true;
+        }
+        break;
+      case VKKind::Pick:
+        vk_toggle_pending(vk, vk_choices[spec.code].key);
+        break;
+      case VKKind::Prev:
+        vk.picker_page = max_ii(0, vk.picker_page - 1);
+        break;
+      case VKKind::Next:
+        if ((vk.picker_page + 1) * VK_PICK_PAGE_SIZE < int(ARRAY_SIZE(vk_choices))) {
+          vk.picker_page++;
+        }
+        break;
+      case VKKind::Clear:
+        vk.pending_count = 0;
+        break;
+      case VKKind::Cancel:
+        vk.picking = false;
+        break;
+      case VKKind::Save:
+        if (vk.selected_slot >= 0 && vk.selected_slot < VK_SLOT_COUNT) {
+          VKSlot &slot = vk.slots[vk.selected_slot];
+          slot.count = vk.pending_count;
+          for (int i = 0; i < 2; i++) {
+            slot.keys[i] = i < slot.count ? vk.pending[i] : GHOST_kKeyUnknown;
+          }
+          vk_slot_label(slot);
+          vk.save_failed = !vk_save(vk);
+        }
+        vk.picking = false;
         break;
     }
   }
@@ -1508,6 +1333,10 @@ bool wm_virtual_keyboard_ghost_event(wmWindowManager *wm,
   vk_ensure_layout(vk, win);
 
   switch (type) {
+    case GHOST_kEventWindowDeactivate:
+      vk_release_all_slots(vk, wm, win);
+      vk_tag_redraw(win);
+      return false;
     case GHOST_kEventCursorMove: {
       const GHOST_TEventCursorData *cd = static_cast<const GHOST_TEventCursorData *>(customdata);
       int xy[2] = {cd->x, cd->y};
@@ -1609,8 +1438,7 @@ void WM_OT_virtual_keyboard_toggle(wmOperatorType *ot)
   ot->name = "Toggle Virtual Keyboard";
   ot->idname = "WM_OT_virtual_keyboard_toggle";
   ot->description =
-      "Show or hide the on-screen keyboard. While it is open it replaces the platform keyboard "
-      "and can send shortcuts and modifiers as well as text";
+      "Show or hide the 14-key customizable shortcut pad";
 
   ot->exec = wm_virtual_keyboard_toggle_exec;
   ot->poll = WM_operator_winactive;
