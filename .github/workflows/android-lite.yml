@@ -38,18 +38,10 @@ jobs:
           set -e
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential \
-            gcc-14 \
-            g++-14 \
-            cmake \
-            ninja-build \
-            patchelf \
-            zip \
-            unzip \
-            git-lfs \
-            openjdk-17-jdk \
-            python3 \
-            curl
+            build-essential gcc-14 g++-14 \
+            cmake ninja-build patchelf \
+            zip unzip git-lfs openjdk-17-jdk \
+            python3 curl
 
           cmake --version
           gcc-14 --version
@@ -61,7 +53,8 @@ jobs:
 
           SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
 
-          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          yes | "$SDKMANAGER" --licenses \
+            >/dev/null || true
 
           "$SDKMANAGER" \
             "platform-tools" \
@@ -71,19 +64,14 @@ jobs:
           echo "Android SDK installed"
 
       - name: Install NDK r30 beta1
+        shell: bash
         run: |
           set -euo pipefail
 
-          REAL_VERSION="30.0.14608247"
-          COMPAT_VERSION="30.0.14904198-beta1"
+          NDK_PATH="$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION"
+          mkdir -p "$ANDROID_HOME/ndk"
 
-          NDK_DIR="$ANDROID_HOME/ndk"
-          REAL_PATH="$NDK_DIR/$REAL_VERSION"
-          COMPAT_PATH="$NDK_DIR/$COMPAT_VERSION"
-
-          mkdir -p "$NDK_DIR"
-
-          if [ ! -f "$REAL_PATH/source.properties" ]; then
+          if [ ! -f "$NDK_PATH/source.properties" ]; then
             curl -fL --retry 3 \
               "https://dl.google.com/android/repository/android-ndk-r30-beta1-linux.zip" \
               -o "$RUNNER_TEMP/android-ndk.zip"
@@ -91,26 +79,46 @@ jobs:
             echo "26b746e5a1e7ac3371f2a862a2f52a7c0740aa8a  $RUNNER_TEMP/android-ndk.zip" \
               | sha1sum -c -
 
-            unzip -q "$RUNNER_TEMP/android-ndk.zip" \
-              -d "$RUNNER_TEMP"
+            mkdir -p "$RUNNER_TEMP/ndk-unpacked"
 
-            mv "$RUNNER_TEMP/android-ndk-r30-beta1" \
-              "$REAL_PATH"
+            unzip -q "$RUNNER_TEMP/android-ndk.zip" \
+              -d "$RUNNER_TEMP/ndk-unpacked"
+
+            PROPERTIES=$(find \
+              "$RUNNER_TEMP/ndk-unpacked" \
+              -maxdepth 3 \
+              -type f \
+              -name source.properties \
+              -print -quit)
+
+            if [ -z "$PROPERTIES" ]; then
+              echo "ERROR: NDK source.properties not found"
+              exit 1
+            fi
+
+            echo "Detected NDK:"
+            cat "$PROPERTIES"
+
+            if ! grep -Fqx \
+              "Pkg.Revision = $ANDROID_NDK_VERSION" \
+              "$PROPERTIES"; then
+              echo "ERROR: Unexpected NDK version"
+              exit 1
+            fi
+
+            mv "$(dirname "$PROPERTIES")" "$NDK_PATH"
 
             rm -f "$RUNNER_TEMP/android-ndk.zip"
           fi
 
-          test -f "$REAL_PATH/source.properties"
-          grep -q "$REAL_VERSION" \
-            "$REAL_PATH/source.properties"
+          test -f "$NDK_PATH/source.properties"
+          test -x "$NDK_PATH/ndk-build"
 
-          ln -sfn "$REAL_PATH" "$COMPAT_PATH"
+          echo "ANDROID_NDK_HOME=$NDK_PATH" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$NDK_PATH" >> "$GITHUB_ENV"
 
-          echo "ANDROID_NDK_ROOT=$COMPAT_PATH" >> "$GITHUB_ENV"
-          echo "ANDROID_NDK_HOME=$COMPAT_PATH" >> "$GITHUB_ENV"
-
-          cat "$REAL_PATH/source.properties"
-          echo "NDK setup complete"
+          echo "NDK installation verified"
+          cat "$NDK_PATH/source.properties"
           df -h
 
       - name: Fetch Blender LFS files
@@ -128,7 +136,7 @@ jobs:
 
           git lfs pull
 
-          echo "LFS download complete"
+          echo "LFS download completed"
           df -h
 
       - name: Fetch Blender dependencies
@@ -161,7 +169,7 @@ jobs:
             "$RUNNER_TEMP/Vulkan-Headers-${VER}/include" \
             ../blender_build_android/lib/vulkan_headers/include
 
-          echo "Vulkan headers ready"
+          echo "Vulkan headers installed"
 
       - name: Verify build environment
         run: |
