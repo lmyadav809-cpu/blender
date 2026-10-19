@@ -1,3 +1,4 @@
+
 name: Blender Android Lite
 
 on:
@@ -44,12 +45,15 @@ jobs:
           java -version
 
       - name: Install Android SDK
+        shell: bash
         run: |
           set -e
+          echo "GitHub SDK path: $ANDROID_HOME"
           SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
           yes | "$SDKMANAGER" --licenses >/dev/null || true
           "$SDKMANAGER" \
             "platform-tools" "build-tools;35.0.1" "platforms;android-35"
+          test -f "$ANDROID_HOME/platforms/android-35/android.jar"
 
       - name: Install NDK r30 beta1
         shell: bash
@@ -73,9 +77,29 @@ jobs:
             mv "$(dirname "$PROPERTIES")" "$NDK_PATH"
             rm -f "$RUNNER_TEMP/android-ndk.zip"
           fi
+          test -f "$NDK_PATH/build/cmake/android.toolchain.cmake"
           test -x "$NDK_PATH/ndk-build"
-          echo "ANDROID_NDK_HOME=$NDK_PATH" >> "$GITHUB_ENV"
-          echo "ANDROID_NDK_ROOT=$NDK_PATH" >> "$GITHUB_ENV"
+          echo "NDK installed: $NDK_PATH"
+
+      - name: Align SDK path with Simfeo build scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          INSTALLED_SDK="$ANDROID_HOME"
+          EXPECTED_SDK="$HOME/android-sdk"
+          if [ "$(realpath -m "$INSTALLED_SDK")" != "$(realpath -m "$EXPECTED_SDK")" ]; then
+            if [ -e "$EXPECTED_SDK" ] && [ ! -L "$EXPECTED_SDK" ]; then
+              echo "ERROR: $EXPECTED_SDK exists and is not a symlink"
+              exit 1
+            fi
+            ln -sfn "$INSTALLED_SDK" "$EXPECTED_SDK"
+          fi
+          test -f "$EXPECTED_SDK/ndk/$ANDROID_NDK_VERSION/build/cmake/android.toolchain.cmake"
+          echo "ANDROID_HOME=$EXPECTED_SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$EXPECTED_SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$EXPECTED_SDK/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$EXPECTED_SDK/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
+          echo "SDK path verified: $EXPECTED_SDK"
           df -h
 
       - name: Fetch Blender source LFS
@@ -98,17 +122,13 @@ jobs:
             credential.https://projects.blender.org.helper \
             '!f() { echo username=; echo password=; }; f'
           git -C lib/linux_x64 lfs pull
-
           TBB=lib/linux_x64/tbb/lib/libtbbmalloc.so
           test -e "$TBB"
           file -L "$TBB"
           if ! file -L "$TBB" | grep -q 'ELF 64-bit'; then
-            echo "ERROR: Linux TBB library is not a real ELF binary."
-            echo "Possible unresolved Git LFS pointer:"
-            head -n 3 "$TBB" || true
+            echo "ERROR: TBB is not an ELF binary"
             exit 1
           fi
-          echo "Host TBB ELF library verified"
           du -sh lib/linux_x64
           df -h
 
@@ -137,14 +157,17 @@ jobs:
             ../blender_build_android/lib/vulkan_headers/include
           rm -f "$RUNNER_TEMP/vulkan.tar.gz"
 
-      - name: Verify build environment
+      - name: Verify Android toolchain and build environment
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
           test -f build_files/android/build.py
-          test -f "$ANDROID_NDK_HOME/source.properties"
+          test -f build_files/android/env.sh
           test -d lib/linux_x64/tbb/lib
           test -d lib/android_arm64
-          file -L lib/linux_x64/tbb/lib/libtbbmalloc.so
+          test -f "$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION/build/cmake/android.toolchain.cmake"
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          bash -lc 'set -e; source build_files/android/env.sh; echo "Simfeo toolchain: $ANDROID_TOOLCHAIN_FILE"; test -f "$ANDROID_TOOLCHAIN_FILE"'
           df -h
           free -h
 
