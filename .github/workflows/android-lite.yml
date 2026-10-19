@@ -1,3 +1,4 @@
+
 name: Blender Android Lite
 
 on:
@@ -12,14 +13,16 @@ jobs:
     timeout-minutes: 360
 
     env:
-      ANDROID_NDK_VERSION: 30.0.14904198-beta1
+      ANDROID_NDK_VERSION: "30.0.14904198-beta1"
       JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
       GIT_TERMINAL_PROMPT: "0"
+      GIT_LFS_SKIP_SMUDGE: "1"
 
     steps:
       - name: Free runner disk space
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/share/powershell
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/share/powershell
           sudo apt-get clean
           df -h
 
@@ -28,58 +31,166 @@ jobs:
         with:
           fetch-depth: 1
           lfs: false
+          submodules: false
 
       - name: Install build tools
         run: |
+          set -e
           sudo apt-get update
           sudo apt-get install -y \
-            gcc-14 g++-14 cmake ninja-build \
-            patchelf zip unzip git-lfs \
-            openjdk-17-jdk python3
+            build-essential \
+            gcc-14 \
+            g++-14 \
+            cmake \
+            ninja-build \
+            patchelf \
+            zip \
+            unzip \
+            git-lfs \
+            openjdk-17-jdk \
+            python3 \
+            curl
+
           cmake --version
           gcc-14 --version
+          java -version
 
-      - name: Install Android NDK and SDK
+      - name: Install Android SDK
         run: |
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
-            --channel=3 \
-            "ndk;30.0.14904198-beta1" \
+          set -e
+
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+
+          "$SDKMANAGER" \
             "platform-tools" \
             "build-tools;35.0.1" \
             "platforms;android-35"
 
+          echo "Android SDK installed"
+
+      - name: Install NDK r30 beta1
+        run: |
+          set -euo pipefail
+
+          REAL_VERSION="30.0.14608247"
+          COMPAT_VERSION="30.0.14904198-beta1"
+
+          NDK_DIR="$ANDROID_HOME/ndk"
+          REAL_PATH="$NDK_DIR/$REAL_VERSION"
+          COMPAT_PATH="$NDK_DIR/$COMPAT_VERSION"
+
+          mkdir -p "$NDK_DIR"
+
+          if [ ! -f "$REAL_PATH/source.properties" ]; then
+            curl -fL --retry 3 \
+              "https://dl.google.com/android/repository/android-ndk-r30-beta1-linux.zip" \
+              -o "$RUNNER_TEMP/android-ndk.zip"
+
+            echo "26b746e5a1e7ac3371f2a862a2f52a7c0740aa8a  $RUNNER_TEMP/android-ndk.zip" \
+              | sha1sum -c -
+
+            unzip -q "$RUNNER_TEMP/android-ndk.zip" \
+              -d "$RUNNER_TEMP"
+
+            mv "$RUNNER_TEMP/android-ndk-r30-beta1" \
+              "$REAL_PATH"
+
+            rm -f "$RUNNER_TEMP/android-ndk.zip"
+          fi
+
+          test -f "$REAL_PATH/source.properties"
+          grep -q "$REAL_VERSION" \
+            "$REAL_PATH/source.properties"
+
+          ln -sfn "$REAL_PATH" "$COMPAT_PATH"
+
+          echo "ANDROID_NDK_ROOT=$COMPAT_PATH" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$COMPAT_PATH" >> "$GITHUB_ENV"
+
+          cat "$REAL_PATH/source.properties"
+          echo "NDK setup complete"
+          df -h
+
       - name: Fetch Blender LFS files
         run: |
+          set -e
+
           git lfs install --local
-          git config lfs.url https://projects.blender.org/blender/blender.git/info/lfs
-          git config --local credential.https://projects.blender.org.helper \
+
+          git config lfs.url \
+            https://projects.blender.org/blender/blender.git/info/lfs
+
+          git config --local \
+            credential.https://projects.blender.org.helper \
             '!f() { echo username=; echo password=; }; f'
+
           git lfs pull
+
+          echo "LFS download complete"
+          df -h
 
       - name: Fetch Blender dependencies
         run: |
+          set -e
+
           git submodule update --init lib/linux_x64
           git submodule update --init lib/android_arm64
+
+          echo "Dependencies downloaded"
           df -h
 
       - name: Install Vulkan headers
         run: |
-          VER=1.4.341
-          curl -fL --retry 3 -o /tmp/vh.tar.gz \
+          set -e
+
+          VER="1.4.341"
+
+          curl -fL --retry 3 \
+            -o "$RUNNER_TEMP/vulkan.tar.gz" \
             "https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v${VER}.tar.gz"
-          tar -xzf /tmp/vh.tar.gz -C /tmp
-          mkdir -p ../blender_build_android/lib/vulkan_headers
-          cp -R "/tmp/Vulkan-Headers-${VER}/include" \
+
+          tar -xzf "$RUNNER_TEMP/vulkan.tar.gz" \
+            -C "$RUNNER_TEMP"
+
+          mkdir -p \
+            ../blender_build_android/lib/vulkan_headers
+
+          cp -R \
+            "$RUNNER_TEMP/Vulkan-Headers-${VER}/include" \
             ../blender_build_android/lib/vulkan_headers/include
+
+          echo "Vulkan headers ready"
+
+      - name: Verify build environment
+        run: |
+          set -e
+
+          test -f build_files/android/build.py
+          test -f build_files/android/env.sh
+
+          test -d lib/linux_x64
+          test -d lib/android_arm64
+
+          test -f \
+            "$ANDROID_NDK_HOME/source.properties"
+
+          echo "Build environment verified"
+          df -h
+          free -h
 
       - name: Build unchanged Blender Lite
         run: |
+          set -e
           python3 build_files/android/build.py lite
 
       - name: Upload Lite APK
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: blender-android-lite
           path: ../blender_build_android/android_apk_stage_lite/blender-lite.apk
           if-no-files-found: error
+          retention-days: 7
+          
