@@ -26,49 +26,32 @@ jobs:
           sudo apt-get clean
           df -h
 
-      - name: Checkout source
+      - name: Checkout Android source
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
           lfs: false
           submodules: false
 
-      - name: Install build tools and libraries
+      - name: Install build tools
         run: |
           set -e
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential \
-            gcc-14 \
-            g++-14 \
-            cmake \
-            ninja-build \
-            patchelf \
-            pkg-config \
-            zip \
-            unzip \
-            git-lfs \
-            openjdk-17-jdk \
-            python3 \
-            curl \
-            libjpeg-dev \
-            libpng-dev \
-            zlib1g-dev \
+            build-essential gcc-14 g++-14 \
+            cmake ninja-build patchelf \
+            pkg-config zip unzip git-lfs \
+            openjdk-17-jdk python3 curl \
+            libjpeg-dev libpng-dev zlib1g-dev \
             libtiff-dev
 
-          cmake --version
           gcc-14 --version
+          cmake --version
           java -version
-
-          echo "Checking host JPEG library"
-          test -f /usr/include/jpeglib.h
-          pkg-config --modversion libjpeg
-          echo "Host JPEG available"
 
       - name: Install Android SDK
         run: |
           set -e
-
           SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
 
           yes | "$SDKMANAGER" --licenses \
@@ -79,7 +62,7 @@ jobs:
             "build-tools;35.0.1" \
             "platforms;android-35"
 
-          echo "Android SDK installed"
+          echo "Android SDK ready"
 
       - name: Install NDK r30 beta1
         shell: bash
@@ -104,17 +87,11 @@ jobs:
 
             PROPERTIES=$(find \
               "$RUNNER_TEMP/ndk-unpacked" \
-              -maxdepth 3 \
-              -type f \
+              -maxdepth 3 -type f \
               -name source.properties \
               -print -quit)
 
-            if [ -z "$PROPERTIES" ]; then
-              echo "ERROR: NDK metadata not found"
-              exit 1
-            fi
-
-            cat "$PROPERTIES"
+            test -n "$PROPERTIES"
 
             grep -Fqx \
               "Pkg.Revision = $ANDROID_NDK_VERSION" \
@@ -130,10 +107,10 @@ jobs:
           echo "ANDROID_NDK_HOME=$NDK_PATH" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_ROOT=$NDK_PATH" >> "$GITHUB_ENV"
 
-          echo "NDK installation verified"
+          echo "NDK verified"
           df -h
 
-      - name: Fetch Blender LFS files
+      - name: Fetch Blender Git LFS
         run: |
           set -e
 
@@ -147,18 +124,42 @@ jobs:
             '!f() { echo username=; echo password=; }; f'
 
           git lfs pull
+          echo "Blender LFS ready"
 
-          echo "LFS download completed"
-          df -h
-
-      - name: Fetch Blender dependencies
+      - name: Download Linux host libraries
         run: |
           set -e
 
-          git submodule update --init lib/linux_x64
-          git submodule update --init lib/android_arm64
+          git -c \
+            'submodule.lib/linux_x64.update=checkout' \
+            submodule update --init --progress \
+            lib/linux_x64
 
-          echo "Dependencies downloaded"
+          echo "Checking Linux host libraries"
+
+          git submodule status lib/linux_x64
+          du -sh lib/linux_x64
+
+          test -d lib/linux_x64/tbb/lib
+
+          echo "Linux host dependencies verified"
+          df -h
+
+      - name: Download Android ARM64 libraries
+        run: |
+          set -e
+
+          git -c \
+            'submodule.lib/android_arm64.update=checkout' \
+            submodule update --init --progress \
+            lib/android_arm64
+
+          git submodule status lib/android_arm64
+          du -sh lib/android_arm64
+
+          test -d lib/android_arm64
+
+          echo "Android dependencies ready"
           df -h
 
       - name: Install Vulkan headers
@@ -183,26 +184,32 @@ jobs:
 
           rm -f "$RUNNER_TEMP/vulkan.tar.gz"
 
-          echo "Vulkan headers installed"
+          echo "Vulkan headers ready"
 
-      - name: Verify build environment
+      - name: Verify complete build environment
         run: |
           set -e
 
           test -f build_files/android/build.py
           test -f build_files/android/env.sh
+          test -f build_files/android/build_apk.sh
 
-          test -d lib/linux_x64
+          test -d lib/linux_x64/tbb/lib
           test -d lib/android_arm64
 
-          test -f \
-            "$ANDROID_NDK_HOME/source.properties"
+          test -f "$ANDROID_NDK_HOME/source.properties"
 
-          test -f /usr/include/jpeglib.h
+          echo "Linux dependencies:"
+          du -sh lib/linux_x64
 
-          echo "Build environment verified"
+          echo "Android dependencies:"
+          du -sh lib/android_arm64
+
+          echo "Available resources:"
           df -h
           free -h
+
+          echo "Ready for Blender Lite build"
 
       - name: Build unchanged Blender Lite
         shell: bash
@@ -216,13 +223,15 @@ jobs:
 
           if [ "$RESULT" -ne 0 ]; then
             echo "===== BUILD FAILURE SUMMARY ====="
+
             grep -n -B 6 -A 6 -E \
-              'CMake Error|Could NOT find|fatal error:|FAILED:|Error:' \
+              'CMake Error|Could NOT find|fatal error:|FAILED:|Error:|No space left' \
               build-lite.log | tail -n 180 || true
+
             exit "$RESULT"
           fi
 
-      - name: Upload build diagnostics
+      - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -231,7 +240,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-      - name: Upload Lite APK
+      - name: Upload Blender Lite APK
         if: success()
         uses: actions/upload-artifact@v4
         with:
