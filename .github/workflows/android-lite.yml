@@ -33,19 +33,37 @@ jobs:
           lfs: false
           submodules: false
 
-      - name: Install build tools
+      - name: Install build tools and libraries
         run: |
           set -e
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential gcc-14 g++-14 \
-            cmake ninja-build patchelf \
-            zip unzip git-lfs openjdk-17-jdk \
-            python3 curl
+            build-essential \
+            gcc-14 \
+            g++-14 \
+            cmake \
+            ninja-build \
+            patchelf \
+            pkg-config \
+            zip \
+            unzip \
+            git-lfs \
+            openjdk-17-jdk \
+            python3 \
+            curl \
+            libjpeg-dev \
+            libpng-dev \
+            zlib1g-dev \
+            libtiff-dev
 
           cmake --version
           gcc-14 --version
           java -version
+
+          echo "Checking host JPEG library"
+          test -f /usr/include/jpeglib.h
+          pkg-config --modversion libjpeg
+          echo "Host JPEG available"
 
       - name: Install Android SDK
         run: |
@@ -92,22 +110,17 @@ jobs:
               -print -quit)
 
             if [ -z "$PROPERTIES" ]; then
-              echo "ERROR: NDK source.properties not found"
+              echo "ERROR: NDK metadata not found"
               exit 1
             fi
 
-            echo "Detected NDK:"
             cat "$PROPERTIES"
 
-            if ! grep -Fqx \
+            grep -Fqx \
               "Pkg.Revision = $ANDROID_NDK_VERSION" \
-              "$PROPERTIES"; then
-              echo "ERROR: Unexpected NDK version"
-              exit 1
-            fi
+              "$PROPERTIES"
 
             mv "$(dirname "$PROPERTIES")" "$NDK_PATH"
-
             rm -f "$RUNNER_TEMP/android-ndk.zip"
           fi
 
@@ -118,7 +131,6 @@ jobs:
           echo "ANDROID_NDK_ROOT=$NDK_PATH" >> "$GITHUB_ENV"
 
           echo "NDK installation verified"
-          cat "$NDK_PATH/source.properties"
           df -h
 
       - name: Fetch Blender LFS files
@@ -169,6 +181,8 @@ jobs:
             "$RUNNER_TEMP/Vulkan-Headers-${VER}/include" \
             ../blender_build_android/lib/vulkan_headers/include
 
+          rm -f "$RUNNER_TEMP/vulkan.tar.gz"
+
           echo "Vulkan headers installed"
 
       - name: Verify build environment
@@ -184,14 +198,38 @@ jobs:
           test -f \
             "$ANDROID_NDK_HOME/source.properties"
 
+          test -f /usr/include/jpeglib.h
+
           echo "Build environment verified"
           df -h
           free -h
 
       - name: Build unchanged Blender Lite
+        shell: bash
         run: |
-          set -e
-          python3 build_files/android/build.py lite
+          set -o pipefail
+
+          python3 build_files/android/build.py lite \
+            2>&1 | tee build-lite.log
+
+          RESULT=${PIPESTATUS[0]}
+
+          if [ "$RESULT" -ne 0 ]; then
+            echo "===== BUILD FAILURE SUMMARY ====="
+            grep -n -B 6 -A 6 -E \
+              'CMake Error|Could NOT find|fatal error:|FAILED:|Error:' \
+              build-lite.log | tail -n 180 || true
+            exit "$RESULT"
+          fi
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: blender-build-diagnostics
+          path: build-lite.log
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Upload Lite APK
         if: success()
