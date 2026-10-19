@@ -73,6 +73,11 @@
 #include "wm_window.hh"
 #include "wm_window_private.hh"
 
+#if defined(__ANDROID__)
+/* Android-only GHOST bridge: keeps native modifier queries aware of held pad keys. */
+extern "C" void GHOST_android_set_virtual_modifier_mask(uint32_t mask);
+#endif
+
 namespace blender {
 
 /* Compact Android shortcut pad. All catalog keys can be assigned to any of 14 slots. */
@@ -982,6 +987,27 @@ static int vk_key_owners(const VirtualKeyboard &vk, const GHOST_TKey key)
   return owners;
 }
 
+/* Keep GHOST's Android modifier query in step with held on-screen shortcuts.
+ * Native mouse, stylus and Bluetooth meta-state remain independent. */
+static void vk_sync_android_modifiers(const VirtualKeyboard &vk)
+{
+#if defined(__ANDROID__)
+  uint32_t mask = 0;
+  if (vk_key_owners(vk, GHOST_kKeyLeftShift) != 0) {
+    mask |= 0x1u;
+  }
+  if (vk_key_owners(vk, GHOST_kKeyLeftControl) != 0) {
+    mask |= 0x2u;
+  }
+  if (vk_key_owners(vk, GHOST_kKeyLeftAlt) != 0) {
+    mask |= 0x4u;
+  }
+  GHOST_android_set_virtual_modifier_mask(mask);
+#else
+  (void)vk;
+#endif
+}
+
 static void vk_send_key_down(VirtualKeyboard &vk,
                              wmWindowManager *wm,
                              wmWindow *win,
@@ -1026,20 +1052,24 @@ static void vk_set_slot_active(VirtualKeyboard &vk,
     return;
   }
   if (active) {
-    /* Put modifiers first, even if they were assigned as the second key. */
+    /* Claim the slot before sending events. This keeps GHOST's modifier query
+     * synchronized even when the injection triggers an immediate state check. */
+    slot.active = true;
+    vk_sync_android_modifiers(vk);
+    /* Put modifiers first; only the first active owner injects a key-down. */
     for (int pass = 0; pass < 2; pass++) {
       for (int i = 0; i < slot.count; i++) {
         const GHOST_TKey key = slot.keys[i];
-        if (vk_is_modifier(key) == (pass == 0) && vk_key_owners(vk, key) == 0) {
+        if (vk_is_modifier(key) == (pass == 0) && vk_key_owners(vk, key) == 1) {
           vk_send_key_down(vk, wm, win, key, slot);
         }
       }
     }
-    slot.active = true;
   }
   else {
-    /* Drop non-modifiers first, and keep shared keys until their final owner releases. */
+    /* Remove this slot's ownership before releases; keep any shared keys held. */
     slot.active = false;
+    vk_sync_android_modifiers(vk);
     for (int pass = 0; pass < 2; pass++) {
       for (int i = slot.count - 1; i >= 0; i--) {
         const GHOST_TKey key = slot.keys[i];
@@ -1071,6 +1101,7 @@ static void vk_close(wmWindowManager *wm, wmWindow *win)
     return;
   }
   vk_release_all_slots(vk, wm, win);
+  vk_sync_android_modifiers(vk);
   if (vk.draw_handle != nullptr) {
     WM_draw_cb_exit(vk.win, vk.draw_handle);
     vk.draw_handle = nullptr;
@@ -1099,6 +1130,7 @@ static void vk_open(wmWindowManager *wm, wmWindow *win)
   if (!vk.loaded) {
     vk_load(vk);
   }
+  vk_sync_android_modifiers(vk);
   vk.open = true;
   vk.win = win;
   vk.offset = 0.0f;
@@ -1175,6 +1207,7 @@ void wm_virtual_keyboard_window_close(wmWindow *win)
     for (VKSlot &slot : g_vk.slots) {
       slot.active = false;
     }
+    vk_sync_android_modifiers(g_vk);
     g_vk.editing = false;
     g_vk.picking = false;
     g_vk.keys.clear();
